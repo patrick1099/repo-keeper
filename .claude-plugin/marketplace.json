@@ -1,0 +1,14 @@
+{
+  "name": "repo-keeper",
+  "owner": { "name": "xu" },
+  "metadata": {
+    "description": "仓库管家:保住一条干净分支,只让代码提交进去"
+  },
+  "plugins": [
+    {
+      "name": "repo-keeper",
+      "source": ".",
+      "description": "嵌入式固件仓库的管家。一个入口 using-repo-keeper,四个环节:开 worktree 别在共享分支上干活 → repo-hygiene 让 git status 只剩代码改动(默认只写 .git/info/,共享文件零改动)→ clangd-config 从 Keil/IAR/CMake 工程生成并自检 .clangd + compile_commands.json → clean-branch 只把代码提交搬进干净分支。有歧义一律非零退出不猜。"
+    }
+  ]
+}
