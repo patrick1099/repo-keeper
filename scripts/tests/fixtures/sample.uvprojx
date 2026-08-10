@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project>
+  <Targets>
+    <Target>
+      <TargetName>App</TargetName>
+      <TargetOption>
+        <TargetCommonOption>
+          <OutputDirectory>.\Objects\</OutputDirectory>
+        </TargetCommonOption>
+      </TargetOption>
+      <TargetArmAds>
+        <ArmAdsMisc><AdsCpuType>"Cortex-M3"</AdsCpuType></ArmAdsMisc>
+        <Cads>
+          <VariousControls>
+            <Define>__DEBUG, USE_HAL</Define>
+            <IncludePath>.\User;..\bsp</IncludePath>
+          </VariousControls>
+        </Cads>
+        <uAC6>0</uAC6>
+      </TargetArmAds>
+      <Groups>
+        <Group>
+          <Files>
+            <File><FilePath>.\User\main.c</FilePath></File>
+            <File><FilePath>.\bsp\led.c</FilePath></File>
+          </Files>
+        </Group>
+      </Groups>
+    </Target>
+  </Targets>
+</Project>

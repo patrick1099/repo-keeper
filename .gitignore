@@ -1,0 +1,16 @@
+# PyInstaller 产物
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 本工具自己的项目配置:私人规则,不进仓库
+.repo-keeper.local.toml
+
+# 编辑器
+.vscode/
+.idea/
