@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Two-layer TOML config: reusable global defaults, per-project overrides.
 
-Why two layers. Identity, doc globs, the protected-branch list and the
-private-comment filter are the same across every repo one person works in;
+Why two layers. Identity, doc globs and the protected-branch list are the same
+across every repo one person works in;
 branch refs, code paths and deliberate-drift whitelists are not. One file per
 repo means copying the shared half into every one of them and watching the
 copies drift. One global file means the project-specific half has nowhere to
@@ -81,12 +81,6 @@ KEY_HINTS = {
     "identity.work": (
         "工作分支上的提交身份",
         GLOBAL, 'work = { name = "...", email = "..." }'),
-    "filters.strip_script": (
-        "私人注释剥离脚本(相对 git common dir);缺失时原样返回,不报错",
-        GLOBAL, 'strip_script = "info/strip_private_comments.py"'),
-    "filters.strip_env": (
-        "覆盖剥离脚本路径的环境变量名(测试注入用)",
-        GLOBAL, 'strip_env = "PRIVCLEAN_STRIP"'),
     "scan.depth": (
         "匹配同步点时回看多少条提交",
         GLOBAL, "depth = 60"),

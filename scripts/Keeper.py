@@ -78,10 +78,6 @@ depth = 60
 # [identity]
 # clean = {{ name = "...", email = "..." }}
 # work  = {{ name = "...", email = "..." }}
-
-# 私人注释剥离脚本(相对 git common dir)。没有就不剥,不报错。
-# [filters]
-# strip_script = "info/strip_private_comments.py"
 '''
 
 PROJECT_TEMPLATE = '''\

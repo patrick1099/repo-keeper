@@ -4,7 +4,7 @@
 CleanBranch.py — 干净分支 <-> 工作分支 对账助手(探测 + 验证)
 
 两条长期分支有**角色分工**:干净分支只放代码(对外/对客户),工作分支是超集
-(代码 + 文档 + 工具 + 私人注释)。它们的历史各自被 filter-branch 改写过,所以
+(代码 + 文档 + 工具)。它们的历史各自被 filter-branch 改写过,所以
 **不能 merge**,只能 cherry-pick;也不能用 patch-id 求差,只能按内容比。
 
 把确定性步骤压成一次调用,给出结论 + 待执行命令。
@@ -12,7 +12,7 @@ CleanBranch.py — 干净分支 <-> 工作分支 对账助手(探测 + 验证)
 
 用法:
     py -3 CleanBranch.py detect     # 探测漂移、待 pick 的 commit、越界文档
-    py -3 CleanBranch.py verify     # 四项不变量验证 (PASS/FAIL)
+    py -3 CleanBranch.py verify     # 三项不变量验证 (PASS/FAIL)
     py -3 CleanBranch.py --explain  # 每个配置值来自哪一层
 
 分支 ref、代码路径、白名单等全部来自两层配置(见 local_config.py),脚本本身
@@ -22,14 +22,11 @@ CleanBranch.py — 干净分支 <-> 工作分支 对账助手(探测 + 验证)
 """
 import argparse
 import os
-import re
 import subprocess
 import sys
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import local_config  # noqa: E402
-from toolname import TOOL_NAME  # noqa: E402
 
 # Windows 控制台默认 cp936，强制 UTF-8 输出避免中文乱码 / emoji 编码错误
 for _s in (sys.stdout, sys.stderr):
@@ -71,11 +68,6 @@ NEVER_PICK = {}
 
 SCAN = 60               # 匹配同步点时回看多少条
 
-# 私人注释剥离脚本:相对 git common dir 的路径,以及可覆盖它的环境变量名
-# (测试注入用)。缺失时 strip_bytes 原样返回,不报错——没装 filter 的机器也能跑。
-STRIP_SCRIPT_REL = "info/strip_private_comments.py"
-STRIP_ENV = TOOL_NAME.upper().replace("-", "_") + "_STRIP"
-
 _REQUIRED = ("branches.clean", "branches.work", "paths.code")
 
 
@@ -87,7 +79,7 @@ def configure(cfg=None):
     branch and still look like it worked.
     """
     global CLEAN_REF, WORK_REF, MAIN_REF, CODE_PATHS, DOC_GLOBS, ALLOW
-    global EXPECTED_DRIFT, NEVER_PICK, SCAN, STRIP_SCRIPT_REL, STRIP_ENV
+    global EXPECTED_DRIFT, NEVER_PICK, SCAN
 
     cfg = cfg if cfg is not None else local_config.load()
     CLEAN_REF, WORK_REF, CODE_PATHS = cfg.require(*_REQUIRED)
@@ -98,8 +90,6 @@ def configure(cfg=None):
     EXPECTED_DRIFT = cfg.get("expected_drift", {})
     NEVER_PICK = cfg.get("never_pick", {})
     SCAN = cfg.get("scan.depth", SCAN)
-    STRIP_SCRIPT_REL = cfg.get("filters.strip_script", STRIP_SCRIPT_REL)
-    STRIP_ENV = cfg.get("filters.strip_env", STRIP_ENV)
     return cfg
 
 
@@ -196,43 +186,6 @@ def find_sync_point():
     return None, None
 
 
-_UNSET = object()
-_STRIP_DERIVED = _UNSET
-
-
-def _strip_script():
-    """剥离脚本路径。环境变量优先（测试注入），否则从 git common dir 推导。缺失返回 None。
-
-    env 每次都读（测试逐用例改它，缓存会串味）；推导路径只算一次——它要跑一次
-    `git rev-parse`，而 strip_bytes 会被调用几十次。
-    """
-    env = os.environ.get(STRIP_ENV) if STRIP_ENV else None
-    if env:
-        return env
-    global _STRIP_DERIVED
-    if _STRIP_DERIVED is _UNSET:
-        common = git(clean_wt(), "rev-parse", "--path-format=absolute",
-                     "--git-common-dir")
-        p = Path(common) / STRIP_SCRIPT_REL
-        _STRIP_DERIVED = str(p) if p.exists() else None
-    return _STRIP_DERIVED
-
-
-def strip_bytes(data: bytes) -> bytes:
-    """按字节剥离私人注释。脚本缺失（未装 filter 的机器）→ 原样返回。"""
-    script = _strip_script()
-    if not script:
-        return data
-    # 必须 py -3，不能裸 python（Windows 商店别名会挂起）；input/capture 全走 bytes，不解码
-    # （源码可能是 GB2312，任何 decode 都会破坏字节）。
-    r = subprocess.run(["py", "-3", script], input=data, capture_output=True)
-    if r.returncode != 0:
-        sys.stderr.write("strip 脚本失败:\n"
-                         + r.stderr.decode("utf-8", "replace") + "\n")
-        sys.exit(2)
-    return r.stdout
-
-
 def _blob(ref, path):
     """取 <ref>:<path> 的字节；不存在返回 None。两分支共享对象库，从 clean_wt 读即可。"""
     r = subprocess.run(["git", "-C", clean_wt(), "cat-file", "-p", f"{ref}:{path}"],
@@ -240,57 +193,24 @@ def _blob(ref, path):
     return r.stdout if r.returncode == 0 else None
 
 
-def _blobs(ref, paths):
-    """批量取 {path: bytes|None}。一次 `git cat-file --batch` 取代 N 次进程启动
-    （实测 Windows 上 255 次 cat-file 要 12.8s，批量后 ~0.1s）。"""
-    if not paths:
-        return {}
-    stdin = b"".join(f"{ref}:{p}\n".encode("utf-8") for p in paths)
-    r = subprocess.run(["git", "-C", clean_wt(), "cat-file", "--batch"],
-                       input=stdin, capture_output=True)
-    if r.returncode != 0:
-        sys.stderr.write("git cat-file --batch 失败:\n"
-                         + r.stderr.decode("utf-8", "replace") + "\n")
-        sys.exit(2)
-    out, pos, result = r.stdout, 0, {}
-    for p in paths:
-        nl = out.find(b"\n", pos)
-        if nl == -1:
-            result[p] = None
-            continue
-        header = out[pos:nl]
-        # 缺失: "<input> missing"；存在: "<oid> blob <size>"
-        parts = header.split(b" ")
-        if len(parts) < 3 or parts[-1] == b"missing":
-            result[p] = None
-            pos = nl + 1
-            continue
-        size = int(parts[2])
-        start = nl + 1
-        result[p] = out[start:start + size]
-        pos = start + size + 1      # 跳过内容尾部的换行
-    return result
-
-
 def path_aligned(path):
-    """两分支在 path 上内容是否已一致。
-
-    .c/.h 走剥离后比较（工作分支带私人注释、干净分支不带，属设计内差异）；
-    其余文件按原始字节比较；单边新增/删除一律判为不一致。
-    """
-    if not path.endswith((".c", ".h")):
-        return _blob(WORK_REF, path) == _blob(CLEAN_REF, path)
+    """两分支在 path 上内容是否已一致（逐字节；单边增删一律判为不一致）。"""
     wb, cb = _blob(WORK_REF, path), _blob(CLEAN_REF, path)
     if wb is None or cb is None:      # 单边增删
         return False
-    return strip_bytes(wb) == strip_bytes(cb)
+    return wb == cb
 
 
 def _real_drift_paths():
-    """两分支间**真实**存在差异的代码路径（已排除纯私人注释差异）。"""
+    """两分支间存在差异的代码路径。
+
+    以前这里还要逐个 path_aligned() 复查一遍,因为「只差私人注释」不算 drift。
+    那套已退役,比较就是纯字节比较 —— 而 diff 报出来的路径按定义就是字节不同,
+    再查一遍恒为真,只是白跑 2N 个 git 进程。
+    """
     names = git(clean_wt(), "diff", "--name-only", WORK_REF, CLEAN_REF,
                 "--", *CODE_PATHS)
-    return [n for n in names.splitlines() if n and not path_aligned(n)]
+    return [n for n in names.splitlines() if n]
 
 
 def _stat(paths):
@@ -350,28 +270,6 @@ def classify_drift():
     expected = [p for p in real if p in EXPECTED_DRIFT]
     unexpected = [p for p in real if p not in EXPECTED_DRIFT]
     return expected, unexpected, _stat(expected), _stat(unexpected)
-
-
-# 字节级预筛：私人注释 = 注释开头符 `//` 或 `/*` 紧跟 marker，marker = '?'(0x3F) 或
-# '？'(0xA3BF)，再紧跟空白(空格/Tab/全角空格 0xA1A1)。已对真剥离脚本实测：marker 必须
-# 紧邻开头符——`// is x ? yes` 不算私人注释，故预筛带上开头符仍是**安全超集**
-# （字符串字面量里的 "//? " 会命中，命中后由 strip 做权威判定）。
-# GB2312 双字节字符尾字节范围 0xA1-0xFE，永不为 0x3F，故字节级匹配对汉字安全。
-_MARKER_RE = re.compile(rb"(//|/\*)(\?|\xa3\xbf)([ \t]|\xa1\xa1)")
-
-
-def clean_marker_leaks():
-    """干净分支上仍含私人注释的 .c/.h 路径列表（authoritative 判据 strip(b) != b）。"""
-    files = [f for f in git(clean_wt(), "ls-tree", "-r", "--name-only",
-                            CLEAN_REF).splitlines()
-             if f.endswith((".c", ".h"))]
-    leaks = []
-    for f, b in _blobs(CLEAN_REF, files).items():
-        if b is None or not _MARKER_RE.search(b):   # 预筛：安全超集，先挡掉绝大多数
-            continue
-        if strip_bytes(b) != b:                     # 权威判据
-            leaks.append(f)
-    return sorted(leaks)
 
 
 def stray_docs():
@@ -503,22 +401,11 @@ def verify():
         ok = False
         print("2. 干净分支越界文档 ...... FAIL ❌ " + str(tracked + untracked))
 
-    leaks = clean_marker_leaks()
-    n_ch = len([f for f in git(clean_wt(), "ls-tree", "-r", "--name-only",
-                               CLEAN_REF).splitlines()
-                if f.endswith((".c", ".h"))])
-    if not leaks:
-        print(f"3. 干净分支私人注释 ...... PASS ✅ ({n_ch} 个 .c/.h 无 marker)")
-    else:
-        ok = False
-        print("3. 干净分支私人注释 ...... FAIL ❌ 仍含私人注释:\n    "
-              + "\n    ".join(leaks))
-
     if MAIN_REF:
         main_line = git(clean_wt(), "log", "--oneline", "-1", MAIN_REF)
-        print(f"4. {MAIN_REF} HEAD ............. {main_line}  (人工核对未变)")
+        print(f"3. {MAIN_REF} HEAD ............. {main_line}  (人工核对未变)")
     else:
-        print("4. 主分支 ................ 跳过（未配置 branches.main）")
+        print("3. 主分支 ................ 跳过（未配置 branches.main）")
 
     print("\n=> " + ("ALL PASS ✅" if ok else "有 FAIL ❌"))
     return 0 if ok else 1
@@ -526,7 +413,7 @@ def verify():
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="干净分支 <-> 工作分支 对账:探测漂移与待搬运的提交,验证四项不变量。"
+        description="干净分支 <-> 工作分支 对账:探测漂移与待搬运的提交,验证三项不变量。"
                     "只报告,不动手。")
     parser.add_argument("action", nargs="?", choices=["detect", "verify"],
                         help="detect=探测待办, verify=不变量 PASS/FAIL")
