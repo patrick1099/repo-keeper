@@ -127,16 +127,12 @@ py -3 scripts/CleanBranch.py verify     # 四项不变量 → PASS/FAIL
 py -3 scripts/PickToClean.py <commit>...  # 工作分支→干净分支
 ```
 
-**`PickToClean.py` 不能换成裸 `git cherry-pick`。** 工作分支可以带私人注释
-（`//? …`），干净分支绝不能。**clean filter 只在 `git add` 时跑，cherry-pick 是逐字节
-复制 blob、根本不跑它** —— 裸 pick 会把私人注释直接送进对外分支。脚本做的是
-`cherry-pick -n` → `git add`（这一步才剥离，用干净分支 worktree 自己的 filter）→
-`commit -C <hash> --reset-author`。剥离复用现有 filter 配置这一唯一真相源，脚本自己
-绝不调剥离脚本、不复制 marker 正则。
-
-**提交身份是核对不是覆盖**：`--reset-author` 拿的是那个 worktree 的 git config（这是
-对的，git config 才是真相源），但一份新检出可能根本没配过，于是提交悄悄签上个人身份
-落进对外分支而一切看起来都成功了。配了 `identity.clean` 时脚本先核对，对不上就停下。
+**`PickToClean.py` 的价值全在动手之前那两道闸**，它们各自对应一种「成功退出但结果是
+错的」：**文档守卫** —— 干净分支的不变量是每条提交只含代码，而一条混了文档的提交照样
+能 pick 成功，文档就静静进了对外分支的记录；所有 commit 一起预检，任一命中就整体拒绝。
+**身份核对** —— `--reset-author` 拿的是那个 worktree 的 git config（这是对的，git config
+才是真相源），但一份新检出可能根本没配过，于是提交悄悄签上个人身份落进对外分支而一切
+看起来都成功了。配了 `identity.clean` 时脚本先核对，对不上就停下。是核对，不是覆盖。
 
 刻意的永久分歧要填**两张表**：`expected_drift` 让 `verify` 不报 FAIL，`never_pick` 让
 `detect` 不把肇事提交列成待办。只填前一张，`verify` 会变绿而 `detect` 仍在劝你把分歧
@@ -144,12 +140,12 @@ py -3 scripts/PickToClean.py <commit>...  # 工作分支→干净分支
 
 ## 配置
 
-两层，因为其中一半（身份、文档 glob、剥离脚本）在你所有仓库里是同一套，重复填既啰嗦
+两层，因为其中一半（身份、文档 glob、受保护分支）在你所有仓库里是同一套，重复填既啰嗦
 又会漂移：
 
 | 层 | 路径 | 装什么 |
 |---|---|---|
-| 全局 | `~/.repo-keeper/defaults.toml` | 身份、文档 glob、受保护分支、剥离脚本、扫描深度 |
+| 全局 | `~/.repo-keeper/defaults.toml` | 身份、文档 glob、受保护分支、扫描深度 |
 | 项目 | `<仓库根>/.repo-keeper.local.toml` | 分支 ref、代码路径、白名单、刻意漂移、拉黑 hash |
 
 合并语义：**表逐键深合并**（项目加一条 `expected_drift` 不会清空全局其余条目）、
@@ -183,7 +179,7 @@ scripts/toolname.py                  工具名的唯一定义处(改名成本控
 scripts/local_config.py              两层 TOML 加载 + 合并 + 来源追踪 + 友好报错
 scripts/RepoHygiene.py               ignore 规则 / skip-worktree 冻结 / 换行归一
 scripts/CleanBranch.py               分支对账:detect / verify
-scripts/PickToClean.py               工作分支→干净分支搬运(剥私人注释 + 核对身份)
+scripts/PickToClean.py               工作分支→干净分支搬运(文档守卫 + 身份核对)
 scripts/Proj2Clangd.py               识别工程类型并分发
 scripts/k2c_common.py                共用:路径格式化 / .clangd 渲染 / 位置校验
 scripts/Keil2Clangd.py               Keil 后端

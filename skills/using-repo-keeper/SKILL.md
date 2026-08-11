@@ -78,7 +78,7 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keeper.py" explain -p <仓库>            #
 ## 配置是两层的
 
 ```
-~/.repo-keeper/defaults.toml        跨项目复用:身份、文档 glob、受保护分支、剥离脚本
+~/.repo-keeper/defaults.toml        跨项目复用:身份、文档 glob、受保护分支、扫描深度
 <仓库根>/.repo-keeper.local.toml    项目特有:分支 ref、代码路径、白名单、刻意漂移
 ```
 

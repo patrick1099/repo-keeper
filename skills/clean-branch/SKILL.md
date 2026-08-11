@@ -1,6 +1,6 @@
 ---
 name: clean-branch
-description: Use when keeping two long-lived branches in sync where they have a content-role split (one pure-code / customer-facing, one superset with docs and tooling) and/or histories that were independently rewritten with filter-branch or rebase. Triggers - a change landed on one branch but not the other, docs appeared on the code-only branch, private annotations must not reach the outward-facing branch, or you need to migrate commits between branches you must NOT merge.
+description: Use when keeping two long-lived branches in sync where they have a content-role split (one pure-code / customer-facing, one superset with docs and tooling) and/or histories that were independently rewritten with filter-branch or rebase. Triggers - a change landed on one branch but not the other, docs appeared on the code-only branch, commits on the outward-facing branch are signed by the wrong identity, or you need to migrate commits between branches you must NOT merge.
 ---
 
 # Clean branch — 只让代码提交进那条干净分支
@@ -22,7 +22,7 @@ description: Use when keeping two long-lived branches in sync where they have a 
    再引进来。**只 cherry-pick。**
 3. **历史改写不均匀时，不要相信 patch-id 类的探测。** `git cherry`、`git log A..B`、
    patch-id 在「同一个改动在两边被过滤成不同样子」时全都给假结果（典型：文档在两边
-   被剥离的时间点不同）。**改用相关路径的真实 tree diff + subject 匹配。**
+   被剔除的时间点不同）。**改用相关路径的真实 tree diff + subject 匹配。**
 4. **按类型把内容迁回它的归属分支**，然后从不该待的地方删掉。
 5. **维护一份显式的例外白名单** —— 那些看着越界、其实是**故意留着**的文件。删任何
    东西之前先查它。
@@ -68,7 +68,7 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/CleanBranch.py" detect    # 同步点 + 待
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/CleanBranch.py" verify    # 四项不变量 → PASS/FAIL；FAIL 则 exit 1
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/CleanBranch.py" --explain # 每个配置值来自全局层还是项目层
 
-py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/PickToClean.py" <commit>... # 工作分支→干净分支：剥私人注释 + 核对身份
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/PickToClean.py" <commit>... # 工作分支→干净分支：过两道闸再 cherry-pick
 ```
 
 **脚本只探测、只报告 —— 它从不 cherry-pick、从不迁移。** 冲突、迁移方向、白名单例外
@@ -122,29 +122,26 @@ doc_globs = ["*.md", "*.csv", "*.txt", "*.docx", "docs/"]
 clean = { name = "...", email = "..." }
 work  = { name = "...", email = "..." }
 
-[filters]
-strip_script = "info/strip_private_comments.py"   # 相对 git common dir
-
 [scan]
 depth = 60                      # 匹配同步点时回看多少条提交
 ```
 
-## 私人注释：为什么 `PickToClean.py` 不能换成裸 `cherry-pick`
+## `PickToClean.py` 的价值在动手之前
 
-工作分支可以提交私人注释（`//? …`、`/*? … */`），干净分支绝不能带。
-**clean filter 只在 `git add` 时跑，而 cherry-pick 是逐字节复制 blob、根本不跑它** ——
-所以裸 pick 会把私人注释直接送进对外分支。
+搬运本身就是 `git cherry-pick` 加一次作者归一。脚本存在的理由是它前面那两道闸，
+它们各自对应一种**成功退出但结果是错的**：
 
-`PickToClean.py` 做的是：`cherry-pick -n` → `git add`（**这一步才剥离**，用的是干净
-分支 worktree 自己的 filter）→ `commit -C <hash> --reset-author`。
+- **文档守卫。** 干净分支的不变量是「每条提交只含代码」。一条混了文档的提交照样能
+  pick 成功，于是文档静静地进了对外分支的记录，git 什么都不会说。所有 commit
+  **一起**预检，任一命中就整体拒绝 —— 不能搬一半。
+- **身份核对，是核对不是覆盖。** `--reset-author` 拿的是那个 worktree 的 git config，
+  这是对的 —— git config 才是真相源。但一份新检出可能根本没配过，于是提交悄悄签上
+  个人身份落进对外分支，而一切看起来都成功了。配了 `identity.clean` 时脚本先核对，
+  对不上就在动手前停下并给出配置命令。
 
-于是「剥离」复用现有 filter 配置这一**唯一真相源**：脚本自己绝不调剥离脚本、不复制
-marker 正则。没装 filter 的机器上剥离退化成原样返回，不报错。
-
-**提交身份是核对，不是覆盖。** `--reset-author` 拿的是那个 worktree 的 git config，
-这是对的 —— git config 才是真相源。但一份新检出可能根本没配过，于是提交悄悄签上个人
-身份落进对外分支，而一切看起来都成功了。所以配了 `identity.clean` 时脚本会先核对，
-对不上就在动手前停下并给出配置命令。
+另外两条小的：**进行中的 cherry-pick 比脏工作区先报** —— 一场没收拾的冲突让两条同时
+不满足，而先说「清理工作区」是把人往错路上指，清理解决不了它。以及 pick 出来是**空提交
+时跳过而不是留个空壳**：内容已经在对面了，对外分支的记录里不该多一条什么都没改的提交。
 
 ## detect 的两道筛子
 
@@ -152,24 +149,21 @@ marker 正则。没装 filter 的机器上剥离退化成原样返回，不报�
 然后把它之后的干净分支提交列为「待 cherry-pick」，但会剔除已经同步过的：
 
 1. **subject 已在对面** —— 便宜，但 subject 可以被改写；
-2. **内容已在对面** —— 该提交改动的代码路径逐字节一致（私人注释剥离之后）。专治
+2. **内容已在对面** —— 该提交改动的代码路径逐字节一致。专治
    *同一改动在两边以不同 subject 分别落地*，这种情况筛子 1 认不出来。这时 cherry-pick
    过去只会得到一个空提交或一次冲突。
 
 工作分支保留刻意的本地分歧时（例如本机 `.clangd`），同步点会卡在它后面不动 —— 这正是
 两道筛子都要存在的原因；那是预期状态，不是待办。
 
-## verify 的四项不变量
+## verify 的三项不变量
 
-1. **代码 drift 为空**，排除两类：
-   - *纯注释差异不算 drift*：两边都有的 `.c/.h` 比的是 `strip(work) == strip(clean)`。
-     非 `.c/.h`、以及只有一边存在的文件，一律算真 drift。
-   - *刻意漂移不算 drift*：`expected_drift` 里的文件永久分歧、永不 FAIL。但它们仍会
-     **连同 `diff --stat` 和你写的理由一起打印** —— 白名单是文件级的，该文件*将来*的
-     改动也不再 FAIL，打印出来的行数是唯一会提醒你的东西。名单要短。
+1. **代码 drift 为空**，排除一类：*刻意漂移不算 drift* —— `expected_drift` 里的文件
+   永久分歧、永不 FAIL。但它们仍会**连同 `diff --stat` 和你写的理由一起打印** ——
+   白名单是文件级的，该文件*将来*的改动也不再 FAIL，打印出来的行数是唯一会提醒你的
+   东西。名单要短。
 2. **干净分支无越界文档**（白名单除外）。
-3. **干净分支无私人注释**：每个 `.c/.h` 满足 `strip(blob) == blob`。
-4. **主分支 HEAD 未变**（人工核对；没配 `branches.main` 就跳过）。
+3. **主分支 HEAD 未变**（人工核对；没配 `branches.main` 就跳过）。
 
 ## 常见错误
 
@@ -181,8 +175,7 @@ marker 正则。没装 filter 的机器上剥离退化成原样返回，不报�
 | 把越界内容提交到代码分支 | 违反不变量。迁回它的归属分支。 |
 | 动了主分支或无关分支 | 保持逐字节不变，永不纳入一次同步。 |
 | 代码冲突盲用 `-X theirs/ours` | 固件冲突手工解。 |
-| 工作分支→干净分支用裸 `git cherry-pick` | filter 不跑 → 私人注释直接落进对外分支，作者还签成个人身份。用 `PickToClean.py`。 |
-| 把纯注释差异报成 drift | 设计如此。`verify` 比较前两边都剥。 |
+| 工作分支→干净分支用裸 `git cherry-pick` | 文档会跟着进对外分支的记录，作者还签成个人身份，而且两样都成功退出。用 `PickToClean.py`。 |
 | 为了让 FAIL 变绿而往 `expected_drift` 里加文件 | 这份名单的含义是「**按设计**永久分歧」，不是「还没搬」。加错一条，该文件将来的每次改动都会被藏起来。 |
 | 看到 `detect` 列了提交就 pick，没先看 drift 是否非空 | drift 干净说明内容已经以别的 subject 在对面了，pick 只会得到空提交/冲突。`detect` 现在按内容过滤了这种，但执行前仍要自己看一眼。 |
 | 干净分支签个人身份，或超集分支签对外身份 | 身份跟着纯度走。配 `identity.clean` 后 `PickToClean.py` 会替你把关。 |
