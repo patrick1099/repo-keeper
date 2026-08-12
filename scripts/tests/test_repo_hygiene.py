@@ -360,6 +360,32 @@ class TestLocalMode(unittest.TestCase):
         self.assertEqual(text2.count(rh.GENERATED_BANNER), 1)
         self.assertEqual(text2.count('我自己加的/'), 1)
 
+    def test_a_block_from_the_old_tool_name_is_replaced_not_kept(self):
+        # The banner carries the tool's name, and the tool has been renamed
+        # (keil2clangd -> repo-keeper). Matching only the current spelling made
+        # the old block read as hand-written content: it was preserved and a
+        # second block appended below it, ~100 duplicated lines under a banner
+        # that says regenerating overwrites everything.
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n'})
+        excl = root / '.git' / 'info' / 'exclude'
+        old_banner = "# 以下规则由 keil2clangd 的 repo-hygiene 生成 —— 重新生成会整体覆盖。"
+        excl.write_text(
+            "我自己加的/\n"
+            + "# " + "=" * 74 + "\n"
+            + old_banner + "\n"
+            + "# " + "=" * 74 + "\n\n"
+            + "*.old-junk\n",
+            encoding='utf-8')
+
+        rh.write_ignore(rh.build_plan(rh.RepoState(root)))
+        text = excl.read_text(encoding='utf-8')
+
+        self.assertNotIn(old_banner, text)
+        self.assertNotIn('*.old-junk', text)
+        self.assertEqual(text.count(rh.GENERATED_BANNER), 1)
+        self.assertEqual(text.count('我自己加的/'), 1)
+
     def test_local_emits_no_negation_because_it_would_lose(self):
         # A repo .gitignore outranks .git/info/exclude, so `!x` here is a lie.
         tmp = tempfile.mkdtemp()

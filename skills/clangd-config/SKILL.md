@@ -87,8 +87,14 @@ No script checks this; it is a reminder to you, not a guarantee from the tool.
 ### 2. Run the script
 
 ```powershell
-py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keil2Clangd.py" -p <uvprojx_parent_dir> -o . -t <target_name> --fix-placement --scan-hidden-macros
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keil2Clangd.py" -p <uvprojx_parent_dir> -t <target_name> --fix-placement --scan-hidden-macros
 ```
+
+`-o` is deliberately absent: it defaults to the `.uvprojx`'s **own directory**.
+It used to default to the process CWD, which made it independent of `-p` — a
+run launched from the repo root dropped the database there, and with two
+projects in one repo the second run landed on top of the first. Pass `-o` only
+when you want the database somewhere other than beside its project.
 
 `--fix-placement` belongs in the default command, not in a second run: Keil's
 standard layout puts the output in `Proj/` and the sources in a sibling
@@ -97,8 +103,19 @@ placement is already fine the flag does nothing.
 
 `--scan-hidden-macros` performs step 3a/3d below.
 
-The exe for later re-anchoring is placed at the project root automatically;
-`--no-exe` skips it, `--exe-dest` picks a different directory.
+The exe for later re-anchoring is placed at the project root automatically, and
+**built first if it is missing or older than the scripts** — `dist/` is
+gitignored, so "never built" is the state of every fresh checkout of this
+plugin. `--no-exe` skips deployment, `--no-build-exe` deploys only a
+pre-existing exe, `--exe-dest` picks a different directory. Installing
+PyInstaller is the one part that is never automatic; if it is missing the run
+prints the pip command and moves on.
+
+**Multiple projects in one repo:** each `.uvprojx` needs its own database in
+its own directory — they cannot share one, and a single `.clangd` above both
+would apply one project's macros to the other's sources. Run the script once
+per project (`--project <file>`), or let `Keeper.py init` do it: it expands
+every `.uvprojx`/`.ewp` it finds into one run each.
 
 Flag any warnings: empty project macros, MISSING include paths, Keil not found.
 
@@ -136,10 +153,24 @@ Never call a macro "dead in all builds" from an `#ifdef` grep alone.
 Include guards and language probes (`__cplusplus`, `__STDC__`, …) are filtered
 out; without that the report is mostly noise.
 
-**3b. Compiler macros (auto-added)** — ARMCC v5 (uAC6=0) needs `__CC_ARM`,
-`__arm__`, arch define; ARM Clang v6 (uAC6=1) needs `__ARMCC_VERSION=6000000`,
-`__arm__`, arch define. Arch must match CPU: M0 → `__ARM_ARCH_6M__`,
-M3 → `__ARM_ARCH_7M__`, M4/M7 → `__ARM_ARCH_7EM__`.
+**3b. Compiler macros (auto-added)** — ARM Clang v6 (uAC6=1) gets
+`__ARMCC_VERSION=6000000`, `__arm__`, arch define. ARMCC v5 (uAC6=0) gets
+`__arm__` and the arch define **only**. Arch must match CPU:
+M0 → `__ARM_ARCH_6M__`, M3 → `__ARM_ARCH_7M__`, M4/M7 → `__ARM_ARCH_7EM__`.
+
+**`__CC_ARM` is not defined for AC5, on purpose.** It is not read by project
+code — it is read by the CMSIS headers on the include path, where
+`cmsis_compiler.h` routes it to `cmsis_armcc.h`, a header written in ARMCC-only
+syntax that clang cannot parse. Measured on a real AC5/Cortex-M0 project:
+defining it produced **14 errors** in `cmsis_armcc.h` and killed the whole
+translation unit's index; leaving it out produced **0 errors** and one harmless
+`#warning Not supported compiler type`. Because the consumer is never in the
+repo, grepping the sources for `__CC_ARM` always says "unused" — which is why
+the wrong default survived so long.
+
+Pass `--cc-arm` for the projects that genuinely need it: ones that vendored the
+CMSIS headers into their own tree, or whose own code branches on the macro. If
+the sources do test it, the hidden-macro scan (3a/3d) will name it.
 
 ### 4. Read the self-check — it already ran
 
@@ -160,9 +191,19 @@ or a list of what is wrong. What it reads back off disk:
 | every `file` entry exists | warning | a `.dep` can list a since-deleted source |
 | `directory` is an existing **absolute** path | **error** | clangd refuses a relative anchor outright |
 | `.clangd` and `compile_commands.json` agree on `-D` | **error** | the two files disagreeing can never be legitimate |
+| a real `clang -fsyntax-only` parses two entries | warning | everything above compares the output against itself |
 
 Errors exit **3**. Warnings only print — pass `--verify-strict` to fail on them
 too, `--no-verify` to skip the check entirely.
+
+**The syntax probe is the only check that asks a compiler anything.** Every
+other row compares the generated files with each other, and all of them can be
+green over a config clangd cannot parse a single line with — that is exactly
+what happened when `__CC_ARM` routed the CMSIS headers into a vendor-syntax
+header and verify reported "0 errors" over a completely dead index. The probe
+runs `clang` from PATH with the generated flags; `--no-syntax-probe` skips it.
+When there is no clang to ask, the report says **SKIPPED**, not OK — read that
+as "nobody checked", because that is what it means.
 
 Your job is to **read the report and act on it**, not to redo it. Missing Keil
 Pack paths are the common warning: scan `{keil}/ARM/PACK/{vendor}/{pack}/` for
@@ -423,7 +464,7 @@ Generated files contain machine/location-bound paths. Measured behavior
 
 ```powershell
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/ReAnchor.py" --root <project_root>
-# or double-click keil2clangd-reanchor.exe at the project root
+# or double-click repo-keeper-reanchor.exe at the project root
 # (build: scripts/build_exe.bat; needs no Python or plugin on the target machine)
 ```
 
@@ -438,8 +479,8 @@ machines with no Python and no plugin, so it must travel with the project. If
 the repo ignores `*.exe` the generator says so and offers the two ways out:
 
 ```powershell
-git add -f keil2clangd-reanchor.exe     # track this one binary
-# or add  !keil2clangd-reanchor.exe  to .gitignore
+git add -f repo-keeper-reanchor.exe     # track this one binary
+# or add  !repo-keeper-reanchor.exe  to .gitignore
 ```
 
 Leaving it untracked is a legitimate third choice — a 9 MB binary in a firmware
@@ -455,12 +496,15 @@ are easy to confuse:
 
 | Question | Compared by | Outcome |
 |---|---|---|
-| Is the built exe older than the scripts? | **mtime** | prints `WARNING the prebuilt exe is OUT OF DATE` |
+| Is there a built exe at all? | file exists | builds one (`dist/` is gitignored, so a fresh checkout has none) |
+| Is the built exe older than the scripts? | **mtime** | says `OUT OF DATE`, then rebuilds |
 | Does the copy in the project differ from the built one? | **content hash** | re-copies, or reports "already current" |
 
-So a project copy is never judged by size or date — only by content. When you
-see that WARNING, or after touching any of those four files, run
-`scripts/build_exe.bat` before trusting the exe.
+So a project copy is never judged by size or date — only by content. The first
+two rows used to only print, and a "skipped"/"WARNING" line in the middle of an
+otherwise successful run is exactly the kind of thing nobody reads; both now
+build. The one step that stays manual is installing PyInstaller — when it is
+absent the run prints the pip command and deploys nothing.
 
 Behavior:
 - Same machine, moved folder: fully automatic — rewrites `directory` only.
@@ -505,7 +549,8 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 | CMake configured with a VS generator | No `compile_commands.json` at all | `-G Ninja` |
 | Config copied in from another project | ReAnchor refuses: "does not belong to this project" | Regenerate; the file list and `-D` cannot be re-anchored |
 | Repo ignores `*.exe` | Re-anchor exe stays untracked | `git add -f`, negate in `.gitignore`, or accept local-only |
-| Exe behaves like an older version | Its `--help`/errors don't match `ReAnchor.py` | It is a stale build — `scripts/build_exe.bat`, then redeploy |
+| Exe behaves like an older version | Its `--help`/errors don't match `ReAnchor.py` | A stale build; a re-run rebuilds and redeploys it. `scripts/build_exe.bat` does the same by hand |
+| No exe anywhere after a run | PyInstaller is not installed | `py -3 -m pip install pyinstaller`, then re-run — the build itself is automatic, the install is not |
 
 # Script options
 
@@ -519,16 +564,21 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 
 `Keil2Clangd.py`
 ```
--p PATH  -o PATH  -a/--absolute  -t/--target-name NAME  -k/--keil-path PATH
+-p PATH  -a/--absolute  -t/--target-name NAME  -k/--keil-path PATH
+-o PATH                Output dir (default: the .uvprojx's own directory)
 --no-clangd  --no-compile-commands  --no-dep  --dep-path PATH
 --project PATH         Explicit .uvprojx, skipping the search (required when
                        -p finds more than one)
 --use-first-target     Take the first target in the XML instead of requiring -t
+--cc-arm               AC5 only: define __CC_ARM (off by default — it makes
+                       clang choke on the pack's cmsis_armcc.h)
 --fix-placement        Pointer .clangd when the output dir is not an ancestor
 --scan-hidden-macros   Report macros the code tests that nothing defines
 --no-verify            Skip the post-generation self-check (it runs by default)
 --verify-strict        Fail on self-check warnings too, not just errors
---no-exe               Do not place keil2clangd-reanchor.exe at the project root
+--no-syntax-probe      Skip the self-check step that parses entries with clang
+--no-exe               Do not place repo-keeper-reanchor.exe at the project root
+--no-build-exe         Deploy the exe only if already built; never run PyInstaller
 --exe-dest DIR         Put the exe somewhere other than the git repo root
 --dry-run              Report everything, write nothing (honoured by every
                        writer, --fix-placement and the exe included)
@@ -536,7 +586,8 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 
 `Iar2Clangd.py`
 ```
--p PATH  -o PATH  -a/--absolute  -c/--config NAME (alias -t/--target-name)
+-p PATH  -a/--absolute  -c/--config NAME (alias -t/--target-name)
+-o PATH               Output dir (default: the .ewp's own directory)
 --project PATH        Explicit .ewp, skipping the search (required when -p
                       finds more than one)
 --use-first-config    Take the first configuration in the XML instead of
@@ -550,6 +601,8 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 --scan-hidden-macros  Report macros the code tests that no configuration defines
 --no-verify           Skip the post-generation self-check (it runs by default)
 --verify-strict       Fail on self-check warnings too, not just errors
+--no-syntax-probe     Skip the self-check step that parses entries with clang
+                      (distinct from --no-probe, which is the IAR macro probe)
 --list-configs  --no-clangd  --no-compile-commands  --fix-placement  --dry-run
 ```
 
@@ -592,4 +645,4 @@ value as another option and fail with "expected one argument".
 | `.clangd` | all | Flags + diagnostics, or a pointer when placement fails |
 | `compile_commands.json` | Keil, IAR | CMake writes its own into the build dir |
 | `k2c_iar_predef.h` | IAR | Probed macros + keyword shims, referenced via a **relative** `-imacros` so re-anchoring survives |
-| `keil2clangd-reanchor.exe` | Keil | Placed at the git repo root; `--no-exe` skips it. Not written for IAR — ReAnchor cannot read IAR layouts |
+| `repo-keeper-reanchor.exe` | Keil | Placed at the git repo root, built on demand when missing or stale; `--no-exe` skips it, `--no-build-exe` skips only the build. Not written for IAR — ReAnchor cannot read IAR layouts |

@@ -910,8 +910,16 @@ def known_macro_names(parser, probe):
 # Generation
 # ---------------------------------------------------------------------------
 
-def generate(parser, resolver, args):
-    output_dir = Path(args.output).resolve()
+def generate(parser, resolver, args, ewp_path=None):
+    if args.output is None:
+        # Same reasoning as the Keil backend: a CWD default silently decouples
+        # -o from the project, so two .ewp files in one repo overwrite each
+        # other's database wherever the caller happened to be standing.
+        output_dir = Path(ewp_path).parent.resolve()
+        print("Output: {0}  (the project's own directory; -o to change)"
+              .format(output_dir))
+    else:
+        output_dir = Path(args.output).resolve()
     if not args.dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -995,7 +1003,8 @@ def generate(parser, resolver, args):
         return 0
 
     return common.run_verify(output_dir, no_verify=args.no_verify,
-                             strict=args.verify_strict)
+                             strict=args.verify_strict,
+                             probe=not args.no_syntax_probe)
 
 
 def _split_probe_args(raw):
@@ -1027,8 +1036,8 @@ def build_arg_parser():
                          'not care which build configuration is indexed')
     ap.add_argument('-a', '--absolute', action='store_true',
                     help='Use absolute paths in generated files')
-    ap.add_argument('-o', '--output', default='.',
-                    help='Output directory (default: current dir)')
+    ap.add_argument('-o', '--output', default=None,
+                    help="Output directory (default: the .ewp's own directory)")
     ap.add_argument('--iar-path', default=None,
                     help='IAR Embedded Workbench path '
                          '(e.g. "D:/Software/IAR Systems/Embedded Workbench 8.0")')
@@ -1059,6 +1068,11 @@ def build_arg_parser():
     ap.add_argument('--verify-strict', action='store_true',
                     help='Treat self-check warnings (missing include dirs, '
                          'missing sources) as failures too')
+    # Not --no-probe: that one is already taken by the IAR predef-macro probe,
+    # and two flags a letter apart doing unrelated things is its own bug.
+    ap.add_argument('--no-syntax-probe', action='store_true',
+                    help='Skip the self-check step that parses a couple of '
+                         'entries with a real clang')
     ap.add_argument('--dry-run', action='store_true',
                     help='Print the analysis without writing files')
     return ap
@@ -1144,7 +1158,7 @@ def main(argv=None):
                                toolchain=parser.get_toolchain(),
                                compiler_id=parser.get_compiler_id())
 
-    return generate(parser, resolver, args)
+    return generate(parser, resolver, args, ewp_path)
 
 
 if __name__ == '__main__':

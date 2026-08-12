@@ -411,6 +411,62 @@ def reanchor_exe_source():
     return cand if cand.is_file() else None
 
 
+def build_reanchor_exe(timeout=600):
+    """Freeze ReAnchor.py into ``dist/`` and return the exe path, or None.
+
+    ``dist/`` is a build artifact and gitignored, so a fresh clone of the plugin
+    -- which is every machine, every time -- has no exe at all. Deployment then
+    printed one "not built -- skipped" line and carried on to report success,
+    and the repo ended up without the one file that can repair its clangd config
+    after a move. Nobody reads a skip line in the middle of a successful run.
+
+    So the missing exe is built rather than announced. What is *not* done
+    automatically is installing PyInstaller: that reaches the network and
+    changes the machine, which is a different kind of decision than compiling a
+    file this repo already ships the source for.
+    """
+    if getattr(sys, 'frozen', False):
+        # Running inside the frozen exe itself; there is nothing to build with.
+        return None
+    try:
+        import PyInstaller  # noqa: F401
+    except ImportError:
+        print("re-anchor exe: PyInstaller is not installed, so it cannot be "
+              "built here.")
+        print("  py -3 -m pip install pyinstaller   (then re-run, or use "
+              "scripts/build_exe.bat)")
+        return None
+
+    here = Path(__file__).resolve().parent
+    print("re-anchor exe: building (PyInstaller, first run takes a minute)...")
+    # --specpath into build/, not beside the scripts: the generated .spec
+    # embeds absolute paths -- this machine's home directory among them -- and
+    # build/ is both gitignored and skipped by the leak sweep.
+    (here / 'build').mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, '-m', 'PyInstaller', '--onefile', '--console',
+               '-y', '--name', Path(REANCHOR_EXE_NAME).stem,
+               '--distpath', str(here / 'dist'),
+               '--workpath', str(here / 'build'),
+               '--specpath', str(here / 'build'),
+               str(here / 'ReAnchor.py')]
+    try:
+        proc = subprocess.run(command, cwd=str(here), capture_output=True,
+                              encoding='utf-8', errors='replace',
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("re-anchor exe: build failed to start ({0})".format(exc))
+        return None
+    built = reanchor_exe_source()
+    if proc.returncode != 0 or built is None:
+        print("re-anchor exe: build FAILED (exit {0}). Last lines:"
+              .format(proc.returncode))
+        for line in (proc.stderr or proc.stdout or '').splitlines()[-8:]:
+            print("    {0}".format(line))
+        return None
+    print("re-anchor exe: built {0}".format(built))
+    return built
+
+
 def reanchor_exe_stale_sources(exe=None):
     """Names of exe sources modified after the prebuilt exe was frozen.
 
@@ -494,7 +550,7 @@ def _git_ignores(path):
     return None
 
 
-def deploy_reanchor_exe(project_root, dry_run=False):
+def deploy_reanchor_exe(project_root, dry_run=False, auto_build=True):
     """Copy the re-anchor exe to ``project_root`` so it is easy to find.
 
     The exe re-anchors by scanning *downwards* from its own directory, so the
@@ -504,21 +560,32 @@ def deploy_reanchor_exe(project_root, dry_run=False):
     """
     src = reanchor_exe_source()
     if src is None:
-        print("re-anchor exe: not built -- skipped "
-              "(build it with scripts/build_exe.bat)")
-        return None
+        if dry_run:
+            print("re-anchor exe: not built yet -- a real run would build it")
+            return None
+        if not auto_build:
+            print("re-anchor exe: not built -- skipped "
+                  "(build it with scripts/build_exe.bat)")
+            return None
+        src = build_reanchor_exe()
+        if src is None:
+            return None
 
-    # Warn before the "already current" shortcut: a stale exe that is already
-    # in place is exactly the case that must not stay quiet.
+    # A stale exe that is already in place is exactly the case that must not
+    # stay quiet -- and rebuilding beats warning, since the warning was easy to
+    # read past in the middle of an otherwise successful run.
     stale = reanchor_exe_stale_sources(src)
     if stale:
         built = time.strftime('%Y-%m-%d', time.localtime(src.stat().st_mtime))
-        print("re-anchor exe: WARNING the prebuilt exe is OUT OF DATE "
-              "(built {0}).".format(built))
-        print("  Newer than it: {0}".format(', '.join(stale)))
-        print("  It will run with the old behaviour, including bugs already "
-              "fixed in the scripts.")
-        print("  Rebuild before relying on it: scripts/build_exe.bat")
+        print("re-anchor exe: the prebuilt exe is OUT OF DATE (built {0}); "
+              "newer than it: {1}".format(built, ', '.join(stale)))
+        rebuilt = None if (dry_run or not auto_build) else build_reanchor_exe()
+        if rebuilt is not None:
+            src = rebuilt
+        else:
+            print("  It will run with the old behaviour, including bugs "
+                  "already fixed in the scripts.")
+            print("  Rebuild before relying on it: scripts/build_exe.bat")
 
     dest = Path(project_root).resolve() / REANCHOR_EXE_NAME
     if dest.is_file() and _same_bytes(src, dest):
@@ -624,14 +691,71 @@ class VerifyReport:
         return '\n'.join(lines)
 
 
-def verify_output(output_dir):
+#: How many entries the syntax probe compiles. One is nearly always enough --
+#: the failures this catches live in the vendor headers every TU pulls in --
+#: and each one costs a real compiler invocation.
+PROBE_ENTRIES = 2
+PROBE_TIMEOUT = 120
+
+
+def probe_syntax(output_dir, max_files=PROBE_ENTRIES, timeout=PROBE_TIMEOUT):
+    """Parse a couple of real entries with clang, and report what it says.
+
+    Every other check in this module compares the generated files against
+    themselves: the -D sets match, the -I directories exist, the paths are
+    absolute. All of that can be true of a config that clangd cannot parse a
+    single line with -- which is exactly what happened when a compat macro
+    routed the CMSIS headers into a vendor-syntax header, and verify reported
+    "0 errors" over a project whose index was entirely dead. A check that never
+    runs the compiler cannot see a parse error, so this one runs it.
+
+    Returns ``(clang_path, results)`` where results is a list of
+    ``(file, error_count, sample_lines)``. ``clang_path`` is None when there is
+    no clang to ask, which is a silence this cannot fix -- not a pass.
+    """
+    clang = shutil.which('clang')
+    cc_path = Path(output_dir).resolve() / 'compile_commands.json'
+    if clang is None or not cc_path.is_file():
+        return clang, []
+    try:
+        entries = json.loads(cc_path.read_text(encoding='utf-8'))
+    except (ValueError, OSError):
+        return clang, []
+
+    results = []
+    for entry in entries[:max_files]:
+        arguments = list(entry.get('arguments') or [])
+        # arguments is [compiler, '-c', file, *flags]; keep only the flags and
+        # hand clang the file separately so -fsyntax-only owns the action.
+        flags = arguments[3:] if len(arguments) > 3 else []
+        source = entry.get('file', '')
+        directory = entry.get('directory') or str(output_dir)
+        try:
+            proc = subprocess.run(
+                [clang, '-fsyntax-only'] + flags + [source],
+                cwd=directory,
+                capture_output=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=timeout,
+                check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        stderr = proc.stderr or ''
+        bad = [ln for ln in stderr.splitlines() if ': error:' in ln]
+        results.append((source, len(bad), bad[:3]))
+    return clang, results
+
+
+def verify_output(output_dir, probe=True):
     """Read the generated .clangd + compile_commands.json back and check them.
 
     Checks, in the order the skill used to ask a human for:
       - every ``-I`` directory exists;
       - every ``file`` entry exists;
       - ``directory`` is an existing absolute path (clangd hard requirement);
-      - the ``-D`` set in .clangd equals the ``-D`` set in the database.
+      - the ``-D`` set in .clangd equals the ``-D`` set in the database;
+      - a real ``clang -fsyntax-only`` actually parses a couple of entries.
     """
     report = VerifyReport()
     output_dir = Path(output_dir).resolve()
@@ -707,10 +831,30 @@ def verify_output(output_dir):
         else:
             report.notes.append("{0} macro(s), consistent across both files"
                                 .format(len(clangd_defines)))
+
+    if probe:
+        clang, results = probe_syntax(output_dir)
+        if clang is None:
+            # Not a pass and not a failure: say which one it is, so "verify OK"
+            # is never read as "clang can parse this".
+            report.notes.append(
+                "syntax probe SKIPPED (no clang on PATH) -- nothing here has "
+                "asked a compiler whether this config parses")
+        elif not results:
+            report.notes.append("syntax probe: no entry could be run")
+        else:
+            broken = [r for r in results if r[1]]
+            report.notes.append("syntax probe: {0} file(s) parsed, {1} with "
+                                "errors".format(len(results), len(broken)))
+            for source, count, sample in broken:
+                report.warnings.append(
+                    "clang reports {0} error(s) parsing {1}".format(count, source))
+                for line in sample:
+                    report.warnings.append("    {0}".format(line.strip()))
     return report
 
 
-def run_verify(output_dir, no_verify=False, strict=False):
+def run_verify(output_dir, no_verify=False, strict=False, probe=True):
     """Verify a freshly generated config and return the process exit code.
 
     Runs by default. An opt-in check is one a hurried caller simply omits,
@@ -718,7 +862,7 @@ def run_verify(output_dir, no_verify=False, strict=False):
     """
     if no_verify:
         return 0
-    report = verify_output(output_dir)
+    report = verify_output(output_dir, probe=probe)
     print(report.describe(strict=strict))
     if report.errors:
         return 3

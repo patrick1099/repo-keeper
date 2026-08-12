@@ -196,6 +196,21 @@ GITATTRIBUTES_BINARYISH = [
 
 GENERATED_BANNER = ("# 以下规则由 {0} 的 repo-hygiene 生成 —— 重新生成会整体覆盖。"
                     .format(TOOL_NAME))
+
+#: Recognises a generated banner written by **any** version of this tool.
+#:
+#: The exact string has already changed once -- keil2clangd became repo-keeper --
+#: and matching only the current spelling made the rename half-land: a block
+#: written under the old name no longer looked generated, so it was preserved as
+#: user content and a second block was appended below it. The file then held two
+#: generated blocks, roughly a hundred duplicated lines, under a banner that
+#: promises the opposite. Nothing failed and nothing said so.
+#:
+#: Matching the shape instead of the literal is what makes the next rename a
+#: non-event. The tool name is the only part allowed to vary; the rest of the
+#: sentence is the signature.
+GENERATED_BANNER_RE = re.compile(
+    r'^# 以下规则由 \S+ 的 repo-hygiene 生成 .*$', re.MULTILINE)
 MANUAL_MARKER = "# ==== 手工增补:这条线以下工具永不改动 ===="
 NEGATION_MARKER = "# ==== 例外 —— 必须留在文件最后:git 按最后一条匹配的规则决定 ===="
 
@@ -481,8 +496,9 @@ def split_existing(text):
     else:
         head, manual = text, ''
     # Our own generated block regenerates from the rule tables; re-reading it
-    # as user input would duplicate it.
-    if GENERATED_BANNER in head:
+    # as user input would duplicate it. Any generation's banner counts -- see
+    # GENERATED_BANNER_RE for what matching only the current one cost.
+    if GENERATED_BANNER_RE.search(head):
         head = ''
 
     # Anything the user appended at end-of-file lands below the negation block.
@@ -588,13 +604,22 @@ def render_gitignore(plan):
 
 
 def _strip_generated(text):
-    """Everything in ``text`` that is not our generated block."""
-    if GENERATED_BANNER not in text:
+    """Everything in ``text`` above our generated block.
+
+    Cuts at the *first* banner from any tool generation, so a file that already
+    collected duplicate blocks from the rename comes back with one.
+    """
+    match = GENERATED_BANNER_RE.search(text)
+    if match is None:
         return text.rstrip('\n')
-    head = text.split('# ' + '=' * 74 + '\n' + GENERATED_BANNER)[0]
-    if head == text:                       # banner present but framing differs
-        head = text.split(GENERATED_BANNER)[0]
-    return head.rstrip('\n')
+    head = text[:match.start()]
+    # The banner normally sits under a framing '# ===...' rule; drop that too,
+    # or every regeneration leaves one more orphaned line behind.
+    frame = '# ' + '=' * 74
+    lines = head.split('\n')
+    while lines and (not lines[-1].strip() or lines[-1].rstrip() == frame):
+        lines.pop()
+    return '\n'.join(lines).rstrip('\n')
 
 
 def write_ignore(plan, shared=False, dry_run=False):
