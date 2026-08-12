@@ -49,6 +49,39 @@ KEIL_FALLBACK_PATHS = ["D:/Keil_v5", "C:/Keil_v5", "C:/Keil"]
 CONFIG_FILE = common.CONFIG_FILE
 
 
+def compat_macros(compiler_info, cpu, cc_arm=False):
+    """The compiler-identity macros to hand clang, as bare macro names.
+
+    AC6 gets ``__ARMCC_VERSION`` because armclang really is clang and the
+    vendor headers behind that macro parse.
+
+    AC5 is the opposite trade, and it used to be made silently. ``__CC_ARM``
+    is not read by project code -- it is read by the CMSIS headers on the
+    include path, where ``cmsis_compiler.h`` routes it to ``cmsis_armcc.h``,
+    a header written in ARMCC-only syntax that clang cannot parse. Defining
+    it costs a dozen errors in that header and takes the whole translation
+    unit's index down with it; leaving it undefined costs one
+    ``#warning Not supported compiler type`` and indexes cleanly. Since the
+    macro's real consumer is never in the repo, grepping the sources for it
+    always says "unused" -- which is why the wrong default went unnoticed.
+
+    So AC5 omits it by default. A project that vendored the CMSIS headers
+    into its own tree, or whose own code branches on ``__CC_ARM``, opts back
+    in with ``--cc-arm``; the hidden-macro scan will name it if the sources
+    do test it.
+    """
+    macros = []
+    if compiler_info["is_ac6"]:
+        macros.append("__ARMCC_VERSION=6000000")
+    elif cc_arm:
+        macros.append("__CC_ARM")
+    macros.append("__arm__")
+    arch_define = CPU_ARCH_DEFINE_MAP.get(cpu)
+    if arch_define:
+        macros.append(arch_define)
+    return macros
+
+
 # ---------------------------------------------------------------------------
 # UvprojxParser
 # ---------------------------------------------------------------------------
@@ -504,12 +537,13 @@ class ClangdGenerator:
     DIAGNOSTICS_SUPPRESS = common.DIAGNOSTICS_SUPPRESS
 
     def __init__(self, parser, keil_resolver, use_absolute=False, base_dir=None,
-                 enrichment=None):
+                 enrichment=None, cc_arm=False):
         self.parser = parser
         self.keil = keil_resolver
         self.use_absolute = use_absolute
         self.base_dir = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
         self.enrichment = enrichment
+        self.cc_arm = cc_arm
 
     def generate(self):
         """Return the .clangd YAML string."""
@@ -524,12 +558,7 @@ class ClangdGenerator:
         target = CPU_TARGET_MAP.get(cpu, "armv6m-none-eabi")
         doc.add_group(f"{cpu}", [f"--target={target}"])
 
-        compat = ["-D__ARMCC_VERSION=6000000"] if compiler_info["is_ac6"] \
-            else ["-D__CC_ARM"]
-        compat.append("-D__arm__")
-        arch_define = CPU_ARCH_DEFINE_MAP.get(cpu)
-        if arch_define:
-            compat.append(f"-D{arch_define}")
+        compat = ["-D" + m for m in compat_macros(compiler_info, cpu, self.cc_arm)]
         doc.add_group("ARM C Compiler compatibility macros", compat)
 
         if defines:
@@ -582,12 +611,13 @@ class CompileCommandsGenerator:
     """Generate compile_commands.json for clangd / IDE integration."""
 
     def __init__(self, parser, keil_resolver, use_absolute=False, base_dir=None,
-                 enrichment=None):
+                 enrichment=None, cc_arm=False):
         self.parser = parser
         self.keil = keil_resolver
         self.use_absolute = use_absolute
         self.base_dir = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
         self.enrichment = enrichment
+        self.cc_arm = cc_arm
 
     def generate(self):
         """Return a list of compile-command entry dicts."""
@@ -603,19 +633,14 @@ class CompileCommandsGenerator:
             source_files = enr.source_files
 
         target = CPU_TARGET_MAP.get(cpu, "armv6m-none-eabi")
-        arch_define = CPU_ARCH_DEFINE_MAP.get(cpu)
 
         # Build common arguments
         base_args = [f"--target={target}"]
 
-        # Compiler macros
-        if compiler_info["is_ac6"]:
-            base_args.append("-D__ARMCC_VERSION=6000000")
-        else:
-            base_args.append("-D__CC_ARM")
-        base_args.append("-D__arm__")
-        if arch_define:
-            base_args.append(f"-D{arch_define}")
+        # Compiler macros -- same source of truth as the .clangd, or verify
+        # will (correctly) report the two files disagreeing on -D.
+        for macro in compat_macros(compiler_info, cpu, self.cc_arm):
+            base_args.append(f"-D{macro}")
 
         # Project defines
         for d in defines:
@@ -666,7 +691,7 @@ class CompileCommandsGenerator:
 # Macro checker
 # ---------------------------------------------------------------------------
 
-def check_macros(parser, keil_resolver):
+def check_macros(parser, keil_resolver, cc_arm=False):
     """Print diagnostic info about the parsed project.
 
     Returns the set of macro names known to be defined somewhere -- this
@@ -697,19 +722,18 @@ def check_macros(parser, keil_resolver):
         print("  WARNING: no project macros found in uvprojx!")
 
     # Compiler macros (auto-added)
-    auto_macros = []
-    if compiler_info["is_ac6"]:
-        auto_macros.append("__ARMCC_VERSION=6000000")
-    else:
-        auto_macros.append("__CC_ARM")
-    auto_macros.append("__arm__")
-    arch_def = CPU_ARCH_DEFINE_MAP.get(cpu)
-    if arch_def:
-        auto_macros.append(arch_def)
+    auto_macros = compat_macros(compiler_info, cpu, cc_arm)
 
     print(f"\n[Auto-added compiler macros] ({len(auto_macros)})")
     for m in auto_macros:
         print(f"  -D{m}")
+    if not compiler_info["is_ac6"] and not cc_arm:
+        # Say it out loud: the omission is deliberate, and the one project that
+        # needs it back has no other way to learn the flag exists.
+        print("  (AC5: __CC_ARM deliberately NOT defined -- it makes clang "
+              "choke on the pack's cmsis_armcc.h.")
+        print("   Pass --cc-arm if this project vendors CMSIS headers or its "
+              "own code branches on it.)")
 
     total = len(defines) + len(auto_macros)
     print(f"\n  Total macros: {total}")
@@ -856,8 +880,19 @@ def main(argv=None):
                     help='Skip compile_commands.json generation')
     ap.add_argument('--dry-run', action='store_true',
                     help='Print info without writing any files')
-    ap.add_argument('-o', '--output', default='.',
-                    help='Output directory (default: current dir)')
+    # Defaulting to the process CWD made -o silently decoupled from -p: a caller
+    # that pointed -p at a project and ran from somewhere else got a database
+    # dropped wherever it happened to stand, and with two projects in one repo
+    # the second run would land on top of the first. The project's own directory
+    # is the one default that is a function of what was asked for.
+    ap.add_argument('-o', '--output', default=None,
+                    help="Output directory (default: the .uvprojx's own "
+                         "directory)")
+    ap.add_argument('--cc-arm', action='store_true',
+                    help='AC5 only: define __CC_ARM. Off by default because it '
+                         'routes the pack CMSIS headers into cmsis_armcc.h, '
+                         'which clang cannot parse. Turn it on for projects '
+                         'that vendor their own CMSIS headers')
     ap.add_argument('--no-dep', action='store_true',
                     help='Ignore Keil .dep build output; use .uvprojx only')
     ap.add_argument('--dep-path', default=None,
@@ -872,9 +907,15 @@ def main(argv=None):
     ap.add_argument('--verify-strict', action='store_true',
                     help='Treat self-check warnings (missing include dirs, '
                          'missing sources) as failures too')
+    ap.add_argument('--no-syntax-probe', action='store_true',
+                    help='Skip the self-check step that parses a couple of '
+                         'entries with a real clang')
     ap.add_argument('--no-exe', action='store_true',
                     help='Do not place {0} in the project root'.format(
                         common.REANCHOR_EXE_NAME))
+    ap.add_argument('--no-build-exe', action='store_true',
+                    help='Deploy {0} only if it was already built; never '
+                         'invoke PyInstaller'.format(common.REANCHOR_EXE_NAME))
     ap.add_argument('--exe-dest', default=None,
                     help='Directory for {0} '
                          '(default: the git repo root above the output dir)'
@@ -915,10 +956,14 @@ def main(argv=None):
     keil = KeilPathResolver(keil_path=args.keil_path)
 
     # Output directory
-    output_dir = Path(args.output).resolve()
+    if args.output is None:
+        output_dir = uvprojx_path.parent.resolve()
+        print(f"Output:  {output_dir}  (the project's own directory; -o to change)")
+    else:
+        output_dir = Path(args.output).resolve()
 
     # Always print macro / path check
-    known_macros = check_macros(parser, keil)
+    known_macros = check_macros(parser, keil, cc_arm=args.cc_arm)
 
     # Build .dep enrichment (ground-truth supplement; XML stays authoritative)
     enrichment = DepEnrichment(found=False)
@@ -961,27 +1006,31 @@ def main(argv=None):
         gen = ClangdGenerator(parser, keil,
                               use_absolute=args.absolute,
                               base_dir=output_dir,
-                              enrichment=enrichment)
+                              enrichment=enrichment,
+                              cc_arm=args.cc_arm)
         gen.write(output_dir, dry_run=args.dry_run)
 
     if not args.no_compile_commands:
         gen = CompileCommandsGenerator(parser, keil,
                                        use_absolute=args.absolute,
                                        base_dir=output_dir,
-                                       enrichment=enrichment)
+                                       enrichment=enrichment,
+                                       cc_arm=args.cc_arm)
         gen.write(output_dir, dry_run=args.dry_run)
 
     if not args.no_exe:
         root = (Path(args.exe_dest).resolve() if args.exe_dest
                 else common.find_project_root(output_dir, sources))
-        common.deploy_reanchor_exe(root, dry_run=args.dry_run)
+        common.deploy_reanchor_exe(root, dry_run=args.dry_run,
+                                   auto_build=not args.no_build_exe)
 
     if args.dry_run:
         print("--dry-run: no files written.")
         return 0
 
     return common.run_verify(output_dir, no_verify=args.no_verify,
-                             strict=args.verify_strict)
+                             strict=args.verify_strict,
+                             probe=not args.no_syntax_probe)
 
 
 if __name__ == '__main__':

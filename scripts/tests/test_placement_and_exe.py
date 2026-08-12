@@ -50,8 +50,14 @@ def sibling_project(base):
 
 
 def run(proj, *extra):
+    # --no-build-exe: deployment is what these tests are about. Left to the
+    # default a fresh checkout would freeze the exe with PyInstaller here,
+    # turning a unit test into a minute-long build that writes into the
+    # plugin's own dist/. --no-syntax-probe likewise: the fixture's includes
+    # are fake, so asking a real clang about them proves nothing.
     cmd = [sys.executable, str(SCRIPT), "-p", str(proj), "-o", str(proj),
-           "-k", "/nonexistent"] + list(extra)
+           "-k", "/nonexistent", "--no-build-exe",
+           "--no-syntax-probe"] + list(extra)
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
@@ -167,7 +173,7 @@ class TestReanchorExeStaleness(unittest.TestCase):
         with mock.patch.object(common, "reanchor_exe_source",
                                return_value=self.fake_exe):
             with redirect_stdout(buf):
-                dest = common.deploy_reanchor_exe(dest_root)
+                dest = common.deploy_reanchor_exe(dest_root, auto_build=False)
         out = buf.getvalue()
         self.assertIn("OUT OF DATE", out)
         self.assertIn("ReAnchor.py", out)
@@ -185,10 +191,25 @@ class TestReanchorExeStaleness(unittest.TestCase):
         with mock.patch.object(common, "reanchor_exe_source",
                                return_value=self.fake_exe):
             with redirect_stdout(buf):
-                common.deploy_reanchor_exe(dest_root)
+                common.deploy_reanchor_exe(dest_root, auto_build=False)
         out = buf.getvalue()
         self.assertIn("OUT OF DATE", out)
         self.assertIn("already current", out)
+
+    def test_stale_exe_is_rebuilt_rather_than_only_warned_about(self):
+        self._set_mtime(self.fake_exe, 0)
+        fresh = Path(self.tmp.name) / "fresh.exe"
+        fresh.write_bytes(b"MZ fresh build")
+        dest_root = Path(self.tmp.name) / "project"
+        dest_root.mkdir()
+        with mock.patch.object(common, "reanchor_exe_source",
+                               return_value=self.fake_exe):
+            with mock.patch.object(common, "build_reanchor_exe",
+                                   return_value=fresh) as build:
+                with redirect_stdout(io.StringIO()):
+                    dest = common.deploy_reanchor_exe(dest_root)
+        build.assert_called_once()
+        self.assertEqual(dest.read_bytes(), b"MZ fresh build")
 
     def test_same_size_different_build_is_replaced(self):
         """Equal sizes were treated as 'already current' -- they are not."""
@@ -203,6 +224,65 @@ class TestReanchorExeStaleness(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 common.deploy_reanchor_exe(dest_root)
         self.assertEqual(dest.read_bytes(), b"MZ fake")
+
+
+class TestReanchorExeIsBuiltWhenMissing(unittest.TestCase):
+    """dist/ is gitignored, so "never built" is the state of every clone.
+
+    Deployment used to print one "not built -- skipped" line and let the run
+    report success, which is how a repo ends up with clangd config and no way
+    to repair it after a move.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dest_root = Path(self.tmp.name) / "project"
+        self.dest_root.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missing_exe_triggers_a_build(self):
+        fresh = Path(self.tmp.name) / "fresh.exe"
+        fresh.write_bytes(b"MZ built on demand")
+        with mock.patch.object(common, "reanchor_exe_source",
+                               return_value=None):
+            with mock.patch.object(common, "build_reanchor_exe",
+                                   return_value=fresh) as build:
+                with redirect_stdout(io.StringIO()):
+                    dest = common.deploy_reanchor_exe(self.dest_root)
+        build.assert_called_once()
+        self.assertEqual(dest.read_bytes(), b"MZ built on demand")
+
+    def test_no_auto_build_keeps_the_old_skip(self):
+        buf = io.StringIO()
+        with mock.patch.object(common, "reanchor_exe_source",
+                               return_value=None):
+            with mock.patch.object(common, "build_reanchor_exe") as build:
+                with redirect_stdout(buf):
+                    dest = common.deploy_reanchor_exe(self.dest_root,
+                                                      auto_build=False)
+        build.assert_not_called()
+        self.assertIsNone(dest)
+        self.assertIn("skipped", buf.getvalue())
+
+    def test_dry_run_never_builds(self):
+        with mock.patch.object(common, "reanchor_exe_source",
+                               return_value=None):
+            with mock.patch.object(common, "build_reanchor_exe") as build:
+                with redirect_stdout(io.StringIO()):
+                    common.deploy_reanchor_exe(self.dest_root, dry_run=True)
+        build.assert_not_called()
+
+    def test_a_failed_build_deploys_nothing_and_says_so(self):
+        with mock.patch.object(common, "reanchor_exe_source",
+                               return_value=None):
+            with mock.patch.object(common, "build_reanchor_exe",
+                                   return_value=None):
+                with redirect_stdout(io.StringIO()):
+                    dest = common.deploy_reanchor_exe(self.dest_root)
+        self.assertIsNone(dest)
+        self.assertEqual(list(self.dest_root.iterdir()), [])
 
 
 class TestFindProjectRoot(unittest.TestCase):

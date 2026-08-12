@@ -33,7 +33,7 @@ import local_config  # noqa: E402
 import Proj2Clangd  # noqa: E402
 import RepoHygiene  # noqa: E402
 from toolname import (GLOBAL_DIR_NAME, PROJECT_CONFIG_NAME,  # noqa: E402
-                      TOOL_NAME)
+                      REANCHOR_EXE, TOOL_NAME)
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -271,26 +271,103 @@ def step_hygiene(root, report, dry_run, apply_writes):
     return 0
 
 
+#: Backends where several project files in one repo mean several independent
+#: databases, each belonging beside its own project file. CMake is absent on
+#: purpose: its many nested CMakeLists.txt describe one build tree, not many.
+_MULTI_PROJECT_KINDS = {"keil", "iar"}
+
+
+def _clangd_projects(found):
+    """The project files init should configure, one entry per database.
+
+    A repo with an App and a Boot .uvprojx needs two databases in two
+    directories -- they cannot share one, and a single .clangd above both would
+    apply App's macros to Boot's sources. Handing the backend the repo root
+    instead only ever produced one of them, and the run before this fix put that
+    one in whatever directory the caller happened to stand in.
+    """
+    projects = []
+    for kind, label, matches in found:
+        if kind in _MULTI_PROJECT_KINDS:
+            projects.extend((kind, label, m) for m in matches)
+        else:
+            projects.append((kind, label, None))
+    return projects
+
+
+def _report_reanchor_exe(root, report, projects):
+    """Say whether the re-anchor exe made it into the repo root.
+
+    Only the Keil backend deploys it (the exe understands Keil layouts and
+    nothing else), and it used to do so with a single line of stdout that said
+    "skipped" when the exe had never been built -- which is the state of every
+    fresh clone of the plugin. init then reported a clean run over a repo that
+    had no way to repair its own clangd config after being moved. If it is not
+    there, that belongs in the summary, not in the scrollback.
+    """
+    if not any(kind == "keil" for kind, _, _ in projects):
+        return
+    exe = Path(root) / REANCHOR_EXE
+    if exe.is_file():
+        report.ok("换路径自修的 {0} 已在仓库根: {1}".format(REANCHOR_EXE, exe))
+        return
+    report.ask("{0} 没能放到仓库根 —— 换机器/换路径后没人能修 clangd 配置。"
+               "看上面这一步的输出是哪一步卡住了。".format(REANCHOR_EXE))
+
+
 def step_clangd(root, report, dry_run):
     print("")
     found = Proj2Clangd.detect(root)
     if not found:
         report.ok("没有 Keil/IAR/CMake 工程,跳过 clangd 配置。")
         return 0
+
+    projects = _clangd_projects(found)
     if dry_run:
-        report.ok("[dry-run] 会为 {0} 工程生成 clangd 配置".format(
-            "/".join(k for k, _, _ in found)))
+        report.ok("[dry-run] 会为 {0} 个工程生成 clangd 配置: {1}".format(
+            len(projects),
+            ", ".join(str(p) if p else k for k, _, p in projects)))
         return 0
-    rc = Proj2Clangd.main(["-p", str(root)])
-    if rc:
-        # Ambiguity is a refusal by design (which target? which config?), not a
-        # crash -- surfacing the command beats swallowing it.
-        report.ask("clangd 配置没生成(退出码 {0})—— 多半是要你指定 target/"
-                   "configuration。照上面的候选列表选一个再跑:".format(rc))
-        report.note('  py -3 Proj2Clangd.py -p "{0}" --target <名字>'.format(root))
-        return 1
-    report.ok("clangd 配置已生成并自检通过")
-    return 0
+
+    if len(projects) > 1:
+        report.note("发现 {0} 个工程,逐个配置(每个工程一份数据库,"
+                    "放在它自己的目录里)。".format(len(projects)))
+
+    stuck = []
+    for kind, label, project in projects:
+        argv = ["--kind", kind, "-p", str(root)]
+        if project is not None:
+            # Both vendor backends take --project, and -o now defaults to the
+            # project's own directory, so this is all it takes to keep two
+            # databases from landing on top of each other.
+            argv += ["--project", str(project)]
+        print("")
+        rc = Proj2Clangd.main(argv)
+        if rc:
+            stuck.append((kind, project, rc))
+
+    _report_reanchor_exe(root, report, projects)
+
+    if not stuck:
+        report.ok("clangd 配置已生成并自检通过({0} 个工程)".format(len(projects)))
+        return 0
+
+    # Ambiguity is a refusal by design (which target? which config?), not a
+    # crash -- surfacing the command beats swallowing it.
+    report.ask("{0}/{1} 个工程的 clangd 配置没生成 —— 多半是要你指定 "
+               "target/configuration。照上面的候选列表选一个再跑:".format(
+                   len(stuck), len(projects)))
+    for kind, project, rc in stuck:
+        flag = "-c" if kind == "iar" else "-t"
+        target = "<configuration 名>" if kind == "iar" else "<target 名>"
+        if project is None:
+            report.note('  py -3 Proj2Clangd.py --kind {0} -p "{1}"  (退出码 {2})'
+                        .format(kind, root, rc))
+        else:
+            report.note('  py -3 Proj2Clangd.py --kind {0} --project "{1}" '
+                        '{2} {3}  (退出码 {4})'
+                        .format(kind, project, flag, target, rc))
+    return 1
 
 
 def step_clean_branch(root, report):

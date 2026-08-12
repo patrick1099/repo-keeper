@@ -91,7 +91,7 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/RepoHygiene.py" -p <repo> --unfreeze [<路�
 ```
 <生成块>            按用途分段,每段/每组上方一行注释说明"为什么"
 # ==== 手工增补 ====   工具永不改动;旧文件里无规则覆盖的行原样搬进这里
-# ==== 例外 ====       !keil2clangd-reanchor.exe,必须在最后
+# ==== 例外 ====       !repo-keeper-reanchor.exe,必须在最后
 ```
 
 - **理由必须独占一行。`.gitignore` 不支持行尾注释** —— `Objects/  # 输出目录` 会被当成

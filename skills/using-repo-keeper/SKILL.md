@@ -51,7 +51,12 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keeper.py" explain -p <仓库>            #
 - 生成两层配置模板（新文件，git 看不见）
 - ignore 规则 → `.git/info/exclude`
 - IDE 状态文件 → `skip-worktree` 冻结（撤销：`RepoHygiene.py --unfreeze`）
-- clangd 配置（生成物，已被上面的规则挡住）
+- clangd 配置（生成物，已被上面的规则挡住）—— **仓库里有几个 `.uvprojx`/`.ewp`
+  就配几个**，每个数据库落在它自己工程目录里。两个工程共用一份是不成立的：
+  一份放在两棵源码树共同祖先上的 `.clangd` 会把 App 的宏盖到 Boot 头上。
+- 换路径自修的 `repo-keeper-reanchor.exe` 放到仓库根（Keil 工程才有；`dist/`
+  是 gitignore 的构建产物，没有就现场构建）。没放成会写进 init 末尾的待办清单，
+  而不是只在滚屏里说一句。
 
 **一定不做**：
 
