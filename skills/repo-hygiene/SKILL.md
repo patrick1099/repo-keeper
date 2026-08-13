@@ -120,6 +120,42 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/RepoHygiene.py" -p <repo> --unfreeze [<路�
 顺序也是承重的:**先写属性,再 renormalize,且 renormalize 时重新探测幻影列表** ——
 写 `-text` 本身会改变归一化方式,可能把干净文件变成新的幻影。
 
+## `[0]` 暂存区:最后一个规则还有用的时刻
+
+报告第一段看的是**已经 `git add`、下一个 commit 就落进仓库**的文件。它排在最前面，因为
+这是时间窗最紧的一类：`git add` 已经**覆盖**了 ignore 规则，而一旦提交，规则对那条路径
+**永远**无效，能用的只剩 `skip-worktree` 或者把它从所有人的检出里删掉。
+
+判据跟别处一致：本该被某条规则挡住的、`FREEZE_RULES` 里的本机状态文件、`REVIEW_RULES`
+里的、扩展名属于 `AUTO_IGNORE_SUFFIXES` 的。**只报告，绝不替你 unstage** —— 别人一次
+刻意的 `git add -f` 是有理由的，而工具看不见那个理由。
+
+撤下来是 `git restore --staged <文件>`（不是 `git rm --cached`，那是给已提交文件的，
+会在同事下次 pull 时删掉他们的）。
+
+## 规则不够用时:让 AI 直接补
+
+看完 `[0]` 和 `[1]` 的剩余项，确认某一类永远不该进仓库，就地加规则：
+
+```bash
+py -3 RepoHygiene.py -p <仓库> --add-rule "<模式>" --why "<理由>" [--rule-layer global]
+py -3 RepoHygiene.py -p <仓库> --write-ignore      # 加完要重写才生效
+```
+
+规则存在自己的文件里，`--add-rule` 会**整体重写**它，所以别在里面手写别的东西：
+
+```
+~/.repo-keeper/extra-ignore.toml          跨项目复用
+<主检出>/.repo-keeper.extra-ignore.toml   本仓库(已被 ignore 挡住,不进仓库)
+```
+
+跟两层 TOML 配置的区别：那边数组**整体替换**，这里两层**拼接** —— 项目加一条，并没有
+对全局那些说过任何话。所以它们不共用一个文件。
+
+两道闸，对人和对 AI 一视同仁：**理由必填**（说不出理由的行就是这个文件失控的起点）；
+**`DANGEROUS_LINES` 里的模式一律拒绝**。AI 替你加一条 `*.py` 跟人手写它是同一个陷阱，
+只是少了一双眼睛盯着 —— 那条规则加的当天看着无害，三个月后静默吞掉你写的脚本。
+
 ## 两条铁律
 
 - **ignore 规则对已跟踪的文件毫无作用。** 报告 `[5]` 末尾的"规则被已跟踪文件架空"
@@ -137,8 +173,14 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/RepoHygiene.py" -p <repo> --unfreeze [<路�
 | `NEGATIONS` | 必须跟着仓库走的例外,渲染在文件最后 |
 | `FREEZE_RULES` | 匹配到的**已跟踪**文件建议 skip-worktree |
 | `REVIEW_RULES` | 匹配到就交给用户判断,工具不动 |
-| `DANGEROUS_LINES` | 旧 `.gitignore` 里遇到就报警的行 |
+| `DANGEROUS_LINES` | 旧 `.gitignore` 里遇到就报警的行，同时也是 `--add-rule` 的黑名单 |
+| `AUTO_IGNORE_SUFFIXES` | 内置规则没覆盖时，允许**现场生成**规则的扩展名 |
 | `GITATTRIBUTES_BINARYISH` | 标 `-text`,防幻影修改复发 |
+
+`AUTO_IGNORE_SUFFIXES` 是封闭表，**每一项都必须是不可能是源码的扩展名**——这就是允许
+工具自己造规则的全部安全论证。`*.log` 不可能吞掉你几个月后写的代码，`*.py` 可以。往里
+加条目前先问这一句。另外：仓库如果**跟踪着**同扩展名的文件，就不生成（说明在这个仓库
+它是刻意保留的），生成的是通配符而不是字面路径（字面清单正是这工具要治的病）。
 
 加规则时**顺手加一条测试**:`scripts/tests/test_repo_hygiene.py`。
 `test_no_rule_carries_an_inline_comment` 挡住行尾注释,

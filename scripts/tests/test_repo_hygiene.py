@@ -7,7 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import RepoHygiene as rh
-from toolname import PROJECT_CONFIG_NAME, REANCHOR_EXE
+from toolname import (EXTRA_IGNORE_PROJECT_NAME, PROJECT_CONFIG_NAME,
+                      REANCHOR_EXE)
 
 
 def _git(args, cwd):
@@ -149,6 +150,168 @@ class TestPlanClassification(unittest.TestCase):
                 'b\n', encoding='utf-8')
             plan = rh.build_plan(rh.RepoState(root))
             self.assertIn(('.clangd', 'Code/App/Proj/.clangd'), plan.shadowed)
+
+
+class TestAutoRules(unittest.TestCase):
+    """内置规则没覆盖的产物,现场识别出来加规则 —— 但只敢碰不可能是源码的。"""
+
+    def plan(self, files, **kw):
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n'})
+        for rel, text in files.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(text.encode('utf-8'))
+        return rh.build_plan(rh.RepoState(root), **kw)
+
+    def test_a_build_log_is_matched_wherever_the_word_sits(self):
+        # `build*.log` only caught logs starting with "build"; this one did not.
+        plan = self.plan({'Code/App/Proj/codex-build.log': 'x'})
+        self.assertIn('Code/App/Proj/codex-build.log', plan.newly_ignored)
+        self.assertEqual(plan.auto_rules, [])   # a shipped rule covers it now
+
+    def test_ai_scratch_scripts_are_covered_by_a_shipped_rule(self):
+        # They are `.py`, and `*.py` is a rule this tool refuses to write, so
+        # they have to be caught by prefix instead.
+        plan = self.plan({'.codex_port_fix.py': 'x', '.claude_scratch.py': 'x'})
+        self.assertIn('.codex_port_fix.py', plan.newly_ignored)
+        self.assertIn('.claude_scratch.py', plan.newly_ignored)
+
+    def test_an_uncovered_junk_extension_gets_a_rule_invented(self):
+        plan = self.plan({'notes.orig': 'x'})
+        self.assertIn('*.orig', dict(plan.auto_rules))
+        self.assertIn('notes.orig', plan.auto_silenced)
+        self.assertIn('notes.orig', plan.newly_ignored)
+
+    def test_the_invented_rule_names_the_file_it_came_from(self):
+        # A generated line whose reason cannot be read is how these files rot.
+        plan = self.plan({'notes.orig': 'x'})
+        self.assertIn('notes.orig', dict(plan.auto_rules)['*.orig'])
+
+    def test_source_is_never_auto_ruled(self):
+        plan = self.plan({'crc16.c': 'x', 'crc16.h': 'x', 'make.bat': 'x'})
+        self.assertEqual(plan.auto_rules, [])
+        for name in ('crc16.c', 'crc16.h', 'make.bat'):
+            self.assertIn(name, plan.still_noisy)
+
+    def test_an_extension_the_repo_tracks_is_not_declared_junk(self):
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n', 'docs/reference.log': 'kept\n'})
+        (root / 'scratch.log').write_bytes(b'x')
+        plan = rh.build_plan(rh.RepoState(root))
+        self.assertNotIn('*.log', dict(plan.auto_rules))
+
+    def test_no_auto_rules_switch_turns_it_off(self):
+        plan = self.plan({'notes.orig': 'x'}, auto=False)
+        self.assertEqual(plan.auto_rules, [])
+        self.assertIn('notes.orig', plan.still_noisy)
+
+    def test_invented_rules_reach_the_written_block(self):
+        plan = self.plan({'notes.orig': 'x'})
+        block = rh.render_rule_block(plan, shared=False)
+        self.assertIn('*.orig', block)
+        self.assertIn('自动识别', block)
+
+
+class TestStagedInspection(unittest.TestCase):
+    """暂存区是最后一个 ignore 规则还有用的时刻 —— 提交之后规则对它永远无效。"""
+
+    def repo(self, files):
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n'})
+        for rel, text in files.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(text.encode('utf-8'))
+        return root
+
+    def test_a_staged_build_artifact_is_reported(self):
+        root = self.repo({'Objects/main.o': 'x'})
+        _git(['add', '-f', 'Objects/main.o'], root)
+        plan = rh.build_plan(rh.RepoState(root))
+        staged = dict(plan.staged_risky)
+        self.assertIn('Objects/main.o', staged)
+        self.assertIn('git add 覆盖 ignore', staged['Objects/main.o'])
+
+    def test_a_staged_local_state_file_is_reported(self):
+        root = self.repo({'Proj/P.uvoptx': 'x'})
+        _git(['add', '-f', 'Proj/P.uvoptx'], root)
+        plan = rh.build_plan(rh.RepoState(root))
+        self.assertIn('Proj/P.uvoptx', dict(plan.staged_risky))
+
+    def test_staged_source_is_not_reported(self):
+        root = self.repo({'feature.c': 'x'})
+        _git(['add', 'feature.c'], root)
+        plan = rh.build_plan(rh.RepoState(root))
+        self.assertEqual(plan.staged_risky, [])
+
+    def test_nothing_staged_is_not_an_error(self):
+        root = self.repo({})
+        plan = rh.build_plan(rh.RepoState(root))
+        self.assertEqual(plan.staged_risky, [])
+
+    def test_the_report_says_how_to_unstage_and_how_to_add_a_rule(self):
+        root = self.repo({'scratch.log': 'x'})
+        _git(['add', '-f', 'scratch.log'], root)
+        text = rh.describe(rh.build_plan(rh.RepoState(root)), shared=False)
+        self.assertIn('git restore --staged', text)
+        self.assertIn('--add-rule', text)
+
+
+class TestExtraRules(unittest.TestCase):
+    """人或 AI 看完报告后加的规则 —— 有自己的文件,两层拼接。"""
+
+    def repo(self):
+        tmp = tempfile.mkdtemp()
+        return make_repo(tmp, {'main.c': 'x\n'})
+
+    def test_an_added_rule_silences_the_file_it_was_added_for(self):
+        root = self.repo()
+        (root / 'vendor.blob').write_bytes(b'x')
+        rh.add_extra_rule(root, '*.blob', '供应商工具的中间产物', 'project')
+        plan = rh.build_plan(rh.RepoState(root))
+        self.assertIn('*.blob', dict(plan.extra_rules))
+        self.assertIn('vendor.blob', plan.newly_ignored)
+
+    def test_the_added_rule_reaches_the_written_block_with_its_reason(self):
+        root = self.repo()
+        rh.add_extra_rule(root, '*.blob', '供应商工具的中间产物', 'project')
+        block = rh.render_rule_block(rh.build_plan(rh.RepoState(root)),
+                                     shared=False)
+        self.assertIn('*.blob', block)
+        self.assertIn('供应商工具的中间产物', block)
+
+    def test_a_dangerous_pattern_is_refused_however_it_is_asked_for(self):
+        # An agent adding *.py on your behalf is the same trap as a human
+        # writing it, with less supervision.
+        root = self.repo()
+        with self.assertRaises(ValueError):
+            rh.add_extra_rule(root, '*.py', '看着像临时脚本', 'project')
+
+    def test_a_rule_without_a_reason_is_refused(self):
+        root = self.repo()
+        with self.assertRaises(ValueError):
+            rh.add_extra_rule(root, '*.blob', '', 'project')
+
+    def test_adding_the_same_rule_twice_does_not_duplicate_it(self):
+        root = self.repo()
+        rh.add_extra_rule(root, '*.blob', '理由', 'project')
+        path, added = rh.add_extra_rule(root, '*.blob', '别的理由', 'project')
+        self.assertFalse(added)
+        self.assertEqual(len(rh.read_extra_rules(path)), 1)
+
+    def test_the_file_it_writes_is_valid_toml_and_survives_quotes(self):
+        root = self.repo()
+        path, _ = rh.add_extra_rule(root, '*.blob', '带"引号"的理由', 'project')
+        self.assertEqual(rh.read_extra_rules(path),
+                         [('*.blob', '带"引号"的理由')])
+
+    def test_the_project_rule_file_is_kept_out_of_git(self):
+        root = self.repo()
+        rh.add_extra_rule(root, '*.blob', '理由', 'project')
+        plan = rh.build_plan(rh.RepoState(root))
+        matcher = rh.Matcher(rh.all_ignore_patterns(plan.extra_rules))
+        self.assertIsNotNone(matcher.match(EXTRA_IGNORE_PROJECT_NAME))
 
 
 class TestOldGitignoreHandling(unittest.TestCase):

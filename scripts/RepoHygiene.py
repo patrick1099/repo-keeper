@@ -51,10 +51,13 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from toolname import PROJECT_CONFIG_NAME, REANCHOR_EXE, TOOL_NAME  # noqa: E402
+from toolname import (EXTRA_IGNORE_GLOBAL_NAME,  # noqa: E402
+                      EXTRA_IGNORE_PROJECT_NAME, GLOBAL_DIR_NAME,
+                      PROJECT_CONFIG_NAME, REANCHOR_EXE, TOOL_NAME)
 
 
 # The report is mostly Chinese. Left to the Windows locale default, piping it
@@ -109,7 +112,10 @@ IGNORE_SECTIONS = [
         ("本地临时目录与 worktree 存放点", [".wt/", ".tmp/", ".edx/"]),
     ]),
     ("日志与分析报表", [
-        ("构建日志", ["build*.log", "build_log*.txt", "*_alog.txt", "*_log.txt",
+        # `build*.log` only matched logs that START with "build", so a
+        # `codex-build.log` sitting next to the project file walked straight
+        # past it. A build log is a build log wherever the word sits.
+        ("构建日志", ["*build*.log", "build_log*.txt", "*_alog.txt", "*_log.txt",
                       "hs_err_pid*.log"]),
         ("Keil 生成的 Flash/RAM 占用分析表",
          ["*_analysis.xlsx", "*_sort_by_flash.csv", "*_sort_by_ram.csv"]),
@@ -122,6 +128,15 @@ IGNORE_SECTIONS = [
         ("Python 字节码与测试缓存",
          ["__pycache__/", "*.pyc", ".pytest_cache/"]),
     ]),
+    # An AI session leaves scratch files in the repo root and they are never
+    # part of the firmware. They cannot be caught by extension -- the ones
+    # seen here were `.py` -- and `*.py` is a rule this tool refuses to write
+    # (see DANGEROUS_LINES), so they are named by their prefix instead.
+    ("AI 会话留下的脚手架(临时脚本、日志,跟固件无关)", [
+        ("codex / claude / opencode / aider 写在仓库里的临时脚本",
+         [".codex_*", ".claude_*", ".opencode_*", ".aider*"]),
+        ("同上,它们的日志", ["codex-*.log", "claude-*.log"]),
+    ]),
     ("本工具自己的产物", [
         ("重写 .gitignore 时留下的旧文件备份", [".gitignore.bak"]),
         # The project config layer holds branch refs, whitelists and the
@@ -129,7 +144,8 @@ IGNORE_SECTIONS = [
         # about a shared repo. It must never be offered up for commit, and
         # covering it here is what makes that automatic rather than a step
         # someone has to remember.
-        ("本工具的项目配置(私人规则,不进仓库)", [PROJECT_CONFIG_NAME]),
+        ("本工具的项目配置与增补规则(私人规则,不进仓库)",
+         [PROJECT_CONFIG_NAME, EXTRA_IGNORE_PROJECT_NAME]),
     ]),
 ]
 
@@ -171,6 +187,27 @@ REVIEW_RULES = [
     ("*.a",    "预编译库:可能是供应商给的,不是你编出来的"),
     ("*.lib",  "同上"),
 ]
+
+# Extensions a rule may be invented for on the spot, when a leftover with one
+# of them shows up and no shipped rule covers it.
+#
+# The table is closed and every entry is an extension that **cannot be source
+# code**, which is the entire safety argument. The failure this tool exists to
+# prevent -- see DANGEROUS_LINES -- is a wildcard that silently swallows files
+# you write months later; `*.log` cannot do that, `*.py` can, so one is
+# auto-generated and the other is refused even when a human asks for it.
+AUTO_IGNORE_SUFFIXES = {
+    ".log":       "日志",
+    ".bak":       "编辑器或工具留下的备份",
+    ".tmp":       "临时文件",
+    ".temp":      "临时文件",
+    ".orig":      "合并冲突残留",
+    ".rej":       "打补丁失败的残片",
+    ".swp":       "Vim 交换文件",
+    ".swo":       "Vim 交换文件",
+    ".dmp":       "崩溃转储",
+    ".stackdump": "崩溃转储",
+}
 
 # Existing .gitignore lines that are actively harmful. Each is something these
 # repos really contain.
@@ -256,6 +293,15 @@ class RepoState:
             ['ls-files', '-z', '--others', '--exclude-standard'], self.root)
         self.deleted = set(git_z(
             ['diff', '--name-only', '-z', '--diff-filter=D'], self.root))
+
+        # Already staged, and new to the repo. This is the last moment an
+        # ignore rule is worth anything: `git add` overrides ignore, and once
+        # the file is committed a rule is inert on it forever -- the only fixes
+        # left are skip-worktree or deleting it out of everyone's checkout.
+        # check=False: a repo with no commits yet has no HEAD to diff against.
+        staged = git(['diff', '--cached', '--name-only', '-z',
+                      '--diff-filter=A'], self.root, check=False)
+        self.staged_added = [e for e in staged.split('\0') if e]
 
         # Two views of "modified" that disagree exactly on the phantoms:
         # diff-files trusts the index stat cache, diff compares content.
@@ -375,13 +421,110 @@ class Matcher:
         return winner
 
 
-def all_ignore_patterns():
+def all_ignore_patterns(extra=None):
     pats = []
     for _title, groups in IGNORE_SECTIONS:
         for _why, patterns in groups:
             pats += patterns
+    pats += [p for p, _why in (extra or [])]
+    # Negations stay last: git resolves a path by the LAST matching pattern,
+    # so anything appended below them silently undoes them.
     pats += [p for p, _why in NEGATIONS]
     return pats
+
+
+EXTRA_HEADER = """\
+# {tool} —— 手工/AI 增补的 ignore 规则。
+#
+# 这个文件由 `RepoHygiene.py --add-rule` 整体重写,**别在里面手写别的内容**,
+# 会被下一次 --add-rule 抹掉。规则本身可以随便删。
+#
+# 跟两层配置(defaults.toml / {project_config})的区别:那边的数组是整体替换,
+# 这里的规则是**两层拼接** —— 项目加一条,并没有对全局那些说过任何话。
+"""
+
+
+def extra_rule_paths(root):
+    """(global, project) locations of the hand-added rule files.
+
+    The project file goes on the MAIN checkout, like every other project-layer
+    file this tool writes: one file serving every linked worktree, instead of
+    a copy per worktree quietly drifting apart.
+    """
+    global_path = Path.home() / GLOBAL_DIR_NAME / EXTRA_IGNORE_GLOBAL_NAME
+    common = git(['rev-parse', '--path-format=absolute', '--git-common-dir'],
+                 root, check=False).strip()
+    main_root = Path(common).parent if common else Path(root)
+    return global_path, main_root / EXTRA_IGNORE_PROJECT_NAME
+
+
+def read_extra_rules(path):
+    if not Path(path).is_file():
+        return []
+    try:
+        with open(path, 'rb') as fh:
+            data = tomllib.load(fh)
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        raise RuntimeError("{0} 读不了: {1}".format(path, exc)) from exc
+    rules = []
+    for entry in data.get('ignore', {}).get('extra', []):
+        if not isinstance(entry, dict):
+            continue
+        pattern = str(entry.get('pattern', '')).strip()
+        if pattern:
+            # A rule nobody can account for is how these files rot, so the
+            # missing reason is stated rather than left blank.
+            rules.append((pattern, str(entry.get('why', '')).strip()
+                          or '(没写理由)'))
+    return rules
+
+
+def load_extra_rules(root):
+    """Hand-added rules, global first then project. They concatenate."""
+    rules = []
+    for path in extra_rule_paths(root):
+        rules += read_extra_rules(path)
+    return rules
+
+
+def _toml_string(value):
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def add_extra_rule(root, pattern, why, layer, dry_run=False):
+    """Append one rule to a layer, rewriting that file wholesale.
+
+    Refuses the patterns in DANGEROUS_LINES no matter who asks. The whole
+    reason that table exists is that `*.py` looks harmless the day it is added
+    and silently swallows a script you write three months later; an agent
+    adding it on your behalf is the same failure with less supervision.
+    """
+    pattern = pattern.strip()
+    if not pattern:
+        raise ValueError("模式是空的")
+    if pattern in DANGEROUS_LINES:
+        raise ValueError("拒绝加这条规则: {0} —— {1}".format(
+            pattern, DANGEROUS_LINES[pattern]))
+    if not why.strip():
+        raise ValueError("必须写理由 —— 说不出理由的行就是这个文件失控的起点")
+
+    path = extra_rule_paths(root)[0 if layer == 'global' else 1]
+    existing = read_extra_rules(path)
+    if any(p == pattern for p, _why in existing):
+        return path, False
+    existing.append((pattern, why.strip()))
+
+    lines = [EXTRA_HEADER.format(tool=TOOL_NAME,
+                                 project_config=PROJECT_CONFIG_NAME),
+             "[ignore]", "extra = ["]
+    for pat, reason in existing:
+        lines.append("  {{ pattern = {0}, why = {1} }},".format(
+            _toml_string(pat), _toml_string(reason)))
+    lines += ["]", ""]
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes("\n".join(lines).encode('utf-8'))
+    return path, True
 
 
 def matches_any(rules, relpath):
@@ -402,6 +545,10 @@ class Plan:
         self.state = state
         self.newly_ignored = []     # untracked paths the new rules silence
         self.still_noisy = []       # untracked paths no rule covers
+        self.auto_rules = []        # (pattern, why) invented from what is here
+        self.auto_silenced = []     # leftovers those invented rules cover
+        self.extra_rules = []       # (pattern, why) added by hand / by the agent
+        self.staged_risky = []      # (path, why) staged, one commit from landing
         self.freeze = []            # (path, why) tracked -> skip-worktree
         self.freeze_dirty = []      # of those, the ones dirty right now
         self.already_frozen = []
@@ -419,9 +566,68 @@ class Plan:
                     or self.absorbed or self.dangerous)
 
 
-def build_plan(state):
+def derive_auto_rules(leftovers, state):
+    """Rules for leftovers no shipped rule covers, invented from what is here.
+
+    Shipping a fixed table means the tool only ever knows the junk somebody
+    already thought of, and the file that bothers you is the one nobody
+    thought of. So look at what the repo actually holds -- but only decide on
+    evidence that cannot be wrong: an extension out of AUTO_IGNORE_SUFFIXES,
+    which by construction cannot be source.
+
+    The generated rule is a wildcard, not the literal path. A literal list is
+    how a .gitignore grows into the dozens of dead paths this tool exists to
+    clean up, and it would need a new line for every rebuild of the same file.
+    """
+    out = {}
+    for path in leftovers:
+        if path.endswith('/'):
+            continue
+        suffix = os.path.splitext(path)[1].lower()
+        why = AUTO_IGNORE_SUFFIXES.get(suffix)
+        if not why or "*" + suffix in out:
+            continue
+        # The repo deliberately tracking such a file is the one piece of
+        # evidence against the guess: a rule would be inert on it anyway, and
+        # writing one would claim this extension is junk here when it is not.
+        if any(p.lower().endswith(suffix) for p in state.tracked):
+            continue
+        out["*" + suffix] = "{0}(自动识别自本仓库里的 {1})".format(why, path)
+    return sorted(out.items())
+
+
+def classify_staged(plan, matcher):
+    """What is staged that probably should not be.
+
+    Staged is the last useful moment: `git add` already overrode any ignore
+    rule, and after the commit a rule is inert on that path forever. Reported
+    only -- unstaging someone's deliberate `git add -f` would be the tool
+    overruling a decision it cannot see the reason for.
+    """
+    for path in plan.state.staged_added:
+        hit = matcher.match(path)
+        if hit:
+            plan.staged_risky.append(
+                (path, "本该被规则 {0} 挡住 —— git add 覆盖 ignore".format(hit)))
+            continue
+        hit = matches_any(FREEZE_RULES, path)
+        if hit:
+            plan.staged_risky.append((path, "本机状态文件:" + hit[1]))
+            continue
+        hit = matches_any(REVIEW_RULES, path)
+        if hit:
+            plan.staged_risky.append((path, hit[1]))
+            continue
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix in AUTO_IGNORE_SUFFIXES:
+            plan.staged_risky.append(
+                (path, AUTO_IGNORE_SUFFIXES[suffix] + ",不像是该进仓库的东西"))
+
+
+def build_plan(state, auto=True):
     plan = Plan(state)
-    matcher = Matcher(all_ignore_patterns())
+    plan.extra_rules = load_extra_rules(state.root)
+    matcher = Matcher(all_ignore_patterns(plan.extra_rules))
 
     for path in state.untracked:
         # git reports untracked directories with a trailing slash; test the
@@ -431,6 +637,23 @@ def build_plan(state):
             plan.newly_ignored.append(path)
         else:
             plan.still_noisy.append(path)
+
+    if auto:
+        plan.auto_rules = derive_auto_rules(plan.still_noisy, state)
+    if plan.auto_rules:
+        invented = Matcher([p for p, _why in plan.auto_rules])
+        remaining = []
+        for path in plan.still_noisy:
+            if invented.match(path.rstrip('/')) or invented.match(path):
+                plan.newly_ignored.append(path)
+                plan.auto_silenced.append(path)
+            else:
+                remaining.append(path)
+        plan.still_noisy = remaining
+        matcher = Matcher(all_ignore_patterns(
+            plan.extra_rules + plan.auto_rules))
+
+    classify_staged(plan, matcher)
 
     # A rule cannot silence a file git already tracks. Saying so up front is
     # the difference between "the rule did nothing" and a bug hunt.
@@ -564,6 +787,22 @@ def render_rule_block(plan, shared):
             # comments, so a trailing `# ...` becomes part of the pattern.
             lines.append("# {0}".format(why))
             lines += patterns
+        lines.append("")
+
+    if plan.extra_rules:
+        lines.append("# ---- 手工/AI 增补(来自 extra-ignore.toml) ----")
+        for pattern, why in plan.extra_rules:
+            lines.append("# {0}".format(why))
+            lines.append(pattern)
+        lines.append("")
+
+    if plan.auto_rules:
+        lines.append("# ---- 自动识别:这个仓库里出现了、而上面规则没覆盖的产物 ----")
+        lines.append("# 只对不可能是源码的扩展名自动生成(见 AUTO_IGNORE_SUFFIXES);")
+        lines.append("# 下次重新生成会按当时的仓库内容重算,不想要就删掉那个文件再跑。")
+        for pattern, why in plan.auto_rules:
+            lines.append("# {0}".format(why))
+            lines.append(pattern)
         lines.append("")
 
     if plan.freeze or plan.already_frozen:
@@ -883,17 +1122,40 @@ def describe(plan, shared=False):
         "本地 —— 只写 .git/info/ 与 .git/index,一个字节都不进仓库,同事无感"))
 
     lines.append("")
+    lines.append("[0] 已经 git add、下一个 commit 就进仓库的")
+    if plan.staged_risky:
+        lines.append("  {0} 个暂存文件看着不该进仓库:".format(len(plan.staged_risky)))
+        for path, why in plan.staged_risky[:15]:
+            lines.append("    - {0}".format(path))
+            lines.append("        {0}".format(why))
+        if len(plan.staged_risky) > 15:
+            lines.append("    - ... 另外 {0} 个".format(len(plan.staged_risky) - 15))
+        lines.append("  ignore 规则对它们已经无效(git add 覆盖 ignore),而且一旦提交,"
+                     "规则对它永远无效。")
+        lines.append("  撤下来: git restore --staged <文件>。确认就是要提交的,不用管。")
+        lines.append("  确认某一类永远不该进来,加条规则:")
+        lines.append('    RepoHygiene.py --add-rule "<模式>" --why "<理由>"')
+    else:
+        lines.append("  无")
+
+    lines.append("")
     lines.append("[1] ignore 规则能解决的 —— 未跟踪的生成物")
     if plan.newly_ignored:
         lines.append("  {0} 个文件/目录将被新规则挡住:".format(len(plan.newly_ignored)))
         lines += _bullet(plan.newly_ignored)
     else:
         lines.append("  无")
+    if plan.auto_rules:
+        lines.append("  其中 {0} 条规则是这次现场识别出来加的(内置规则没覆盖):"
+                     .format(len(plan.auto_rules)))
+        for pattern, why in plan.auto_rules:
+            lines.append("    - {0}    <- {1}".format(pattern, why))
     if plan.still_noisy:
         lines.append("  规则覆盖不到、仍会出现在 git status 里的 {0} 个:"
                      .format(len(plan.still_noisy)))
         lines += _bullet(plan.still_noisy)
-        lines.append("    (这些多半是真该提交的东西 —— 如果不是,告诉我加规则)")
+        lines.append("    (剩在这儿的都是可能是源码的 —— 自动识别只敢碰"
+                     "不可能是源码的扩展名。真该忽略就告诉我加规则)")
 
     lines.append("")
     lines.append("[2] ignore 规则解决不了的 —— 已跟踪、但只有本机在改")
@@ -1034,6 +1296,15 @@ def main(argv=None):
                         help="等于同时给上面三个开关")
     parser.add_argument('--unfreeze', nargs='*', metavar='PATH',
                         help="清除 skip-worktree;不给路径就解冻全部已冻结文件")
+    parser.add_argument('--no-auto-rules', action='store_true',
+                        help="不要现场识别内置规则没覆盖的产物,只用内置规则")
+    parser.add_argument('--add-rule', metavar='PATTERN',
+                        help="增补一条 ignore 规则(给人或 AI 看完 [0]/[1] 之后用)")
+    parser.add_argument('--why', metavar='REASON',
+                        help="随 --add-rule:这条规则为什么存在(必填)")
+    parser.add_argument('--rule-layer', choices=['project', 'global'],
+                        default='project',
+                        help="随 --add-rule:加到本仓库还是跨项目复用(默认 project)")
     parser.add_argument('--dry-run', action='store_true',
                         help="走真实写入路径但不落盘,报告将会发生什么")
     args = parser.parse_args(argv)
@@ -1049,6 +1320,23 @@ def main(argv=None):
     do_renorm = args.renormalize or args.apply
 
     for root in repos:
+        if args.add_rule:
+            try:
+                path, added = add_extra_rule(root, args.add_rule,
+                                             args.why or '',
+                                             args.rule_layer,
+                                             dry_run=args.dry_run)
+            except ValueError as exc:
+                print("{0}".format(exc))
+                return 2
+            print("{0}: {1} -> {2}{3}".format(
+                root, args.add_rule,
+                "已加入 " + str(path) if added else "已经在 {0} 里了".format(path),
+                " (--dry-run,未落盘)" if args.dry_run and added else ""))
+            print("规则要生效,还得重写 ignore 文件: RepoHygiene.py -p {0} "
+                  "--write-ignore".format(root))
+            continue
+
         state = RepoState(root)
 
         if args.unfreeze is not None:
@@ -1060,7 +1348,7 @@ def main(argv=None):
             apply_unfreeze(state, targets, dry_run=args.dry_run)
             continue
 
-        plan = build_plan(state)
+        plan = build_plan(state, auto=not args.no_auto_rules)
         print(describe(plan, shared=shared))
 
         if not (do_ignore or do_freeze or do_renorm):
@@ -1085,7 +1373,8 @@ def main(argv=None):
         if not shared:
             print(LOCAL_MODE_CAVEATS)
 
-    if not (do_ignore or do_freeze or do_renorm) and args.unfreeze is None:
+    if (not (do_ignore or do_freeze or do_renorm)
+            and args.unfreeze is None and not args.add_rule):
         print("")
         print("以上只是扫描,什么都没写。要执行(默认全走本机,不碰仓库文件):")
         print("  --write-ignore      只写 .git/info/exclude")

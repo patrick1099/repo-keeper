@@ -84,6 +84,72 @@ class TestProtectedBranch(KeeperTest):
         self.assertIn("受保护分支 task/x", out)
 
 
+class TestPushableBranch(KeeperTest):
+    """能推到远端 = 禁地。名单是人维护的,远端不是 —— 闸架在远端那一侧。"""
+
+    def setUp(self):
+        super().setUp()
+        # A bare repo standing in for the company remote. `git remote add` is
+        # not enough: the gate asks the remote what it has.
+        self.remote = self.base / "origin.git"
+        _git(["init", "-q", "--bare", str(self.remote)], self.base)
+        _git(["remote", "add", "origin", str(self.remote)], self.root)
+        _git(["push", "-q", "origin", "main"], self.root)
+
+    def test_a_branch_that_exists_on_the_remote_is_off_limits(self):
+        # Not in `protected`, no upstream configured -- nothing local says it
+        # is special. Only the remote does, and that is the whole point.
+        _git(["push", "-q", "origin", "main:通用版"], self.root)
+        _git(["checkout", "-q", "-b", "通用版"], self.root)
+        rc, out, _ = self.run_keeper("init", "-p", str(self.root))
+        self.assertEqual(rc, 1)
+        self.assertIn("能直接推到远端", out)
+        self.assertFalse(self.project_cfg.exists())
+
+    def test_an_upstream_makes_a_branch_off_limits(self):
+        _git(["checkout", "-q", "-b", "feat/x"], self.root)
+        _git(["push", "-q", "-u", "origin", "feat/x"], self.root)
+        rc, out, _ = self.run_keeper("init", "-p", str(self.root))
+        self.assertEqual(rc, 1)
+        self.assertIn("upstream", out)
+
+    def test_a_local_only_branch_still_proceeds(self):
+        _git(["checkout", "-q", "-b", "task/local"], self.root)
+        rc, out, _ = self.run_keeper("init", "-p", str(self.root))
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self.project_cfg.exists())
+
+    def test_a_no_push_branch_is_not_treated_as_pushable(self):
+        # clean-branch's deliberate never-push hatch: pushRemote naming
+        # something that is not a remote. Honouring it keeps the tool/debug
+        # branch usable even though the remote has the same name.
+        _git(["push", "-q", "origin", "main:debug"], self.root)
+        _git(["checkout", "-q", "-b", "debug"], self.root)
+        _git(["config", "branch.debug.pushRemote", "no_push"], self.root)
+        rc, out, _ = self.run_keeper("init", "-p", str(self.root))
+        self.assertEqual(rc, 0, out)
+
+    def test_the_new_worktree_branch_is_vetted_too(self):
+        # Escaping to a worktree is pointless if the branch you land on is
+        # itself pushable.
+        _git(["push", "-q", "origin", "main:通用版"], self.root)
+        rc, out, _ = self.run_keeper("init", "-p", str(self.root),
+                                     "--worktree", str(self.base / "wt"),
+                                     "--branch", "通用版")
+        self.assertEqual(rc, 1)
+        self.assertIn("换个只在本机存在的名字", out)
+        self.assertFalse((self.base / "wt").exists())
+
+    def test_an_unreachable_remote_falls_back_and_says_so(self):
+        _git(["push", "-q", "origin", "main:通用版"], self.root)
+        _git(["fetch", "-q", "origin"], self.root)
+        _git(["checkout", "-q", "-b", "通用版"], self.root)
+        _git(["remote", "set-url", "origin", str(self.base / "gone.git")], self.root)
+        rc, out, _ = self.run_keeper("init", "-p", str(self.root))
+        self.assertEqual(rc, 1)
+        self.assertIn("上次 fetch 的快照", out)
+
+
 class TestWorktree(KeeperTest):
     def test_creates_the_worktree_and_continues_in_it(self):
         wt = self.base / "wt"
