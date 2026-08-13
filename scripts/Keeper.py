@@ -42,6 +42,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 DEFAULT_PROTECTED = ["main", "master"]
+REMOTE_TIMEOUT = 10        # 秒:问远端的上限,连不上就退回本地缓存,不卡在第一步
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,10 @@ GLOBAL_TEMPLATE = '''\
 # 合并规则:表逐键深合并、数组整体替换、标量项目优先。
 
 [branches]
-# 受保护分支:不在上面直接干活,init 会建议你开 worktree
+# 额外的受保护分支。**主闸不在这张表里** —— init 每次跑都现问一遍远端
+# (git ls-remote),凡是能直接推上去的分支(远端有同名分支、或配了 upstream)
+# 一律不许在上面干活,不用你维护名单。这张表只补那些远端还没有、但你就是
+# 不想在上面动的分支。
 protected = ["main", "master"]
 # 主分支:同步时只读核对,绝不触碰
 main = "main"
@@ -153,6 +157,81 @@ def worktree_list(path):
     return entries
 
 
+def _git_networked(args, cwd, timeout):
+    """A git call that talks to a remote: never prompt, never hang forever.
+
+    A credential prompt or a dead VPN would otherwise stall ``init`` at its
+    very first step, which is a worse failure than answering from cache.
+    """
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    env.setdefault("GIT_ASKPASS", "echo")
+    env.setdefault("SSH_ASKPASS", "echo")
+    try:
+        r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True,
+                           encoding="utf-8", timeout=timeout, env=env)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+class RemoteView:
+    """What the remote actually has, asked once per run.
+
+    A hand-kept ``branches.protected`` list only ever contains the branches
+    somebody remembered to type, and the branch that hurts is the one nobody
+    typed. The real question is narrower and answerable: **can a plain
+    ``git push`` from this branch reach the shared repo?** If it can, then
+    every private thing this plugin and its user put in the tree -- clangd
+    config, docs, scaffolding, AI output -- is one reflex away from the
+    company's repo. Only the remote knows the answer, so ask it.
+    """
+
+    def __init__(self, root, timeout=REMOTE_TIMEOUT):
+        self.root = root
+        self.remotes = (git(["remote"], root) or "").split()
+        self.names = set()
+        self.source = "none"
+        if not self.remotes:
+            return
+        for remote in self.remotes:
+            out = _git_networked(["ls-remote", "--heads", remote], root, timeout)
+            if out is None:
+                continue
+            self.source = "remote"
+            for line in out.splitlines():
+                _, _, ref = line.partition("\t")
+                if ref.startswith("refs/heads/"):
+                    self.names.add(ref[len("refs/heads/"):])
+        if self.source == "remote":
+            return
+        # Offline, VPN down, auth refused. refs/remotes is the last fetch's
+        # picture: stale, but dropping the gate entirely is the worse failure,
+        # so fall back and say which answer this is.
+        cached = git(["for-each-ref", "--format=%(refname:strip=3)",
+                      "refs/remotes"], root) or ""
+        self.names = {n for n in cached.splitlines() if n and n != "HEAD"}
+        self.source = "cache"
+
+    def pushable(self, branch):
+        """Why a commit on `branch` could reach the shared repo, or None."""
+        if not self.remotes:
+            return None
+        target = (git(["config", "branch.{0}.pushRemote".format(branch)], self.root)
+                  or git(["config", "remote.pushDefault"], self.root))
+        if target and target not in self.remotes:
+            # A pushRemote naming something that is not a remote is the
+            # deliberate never-push hatch clean-branch documents
+            # (`branch.<x>.pushRemote = no_push`). Honour it.
+            return None
+        if git(["rev-parse", "--abbrev-ref", branch + "@{upstream}"], self.root):
+            return "配了 upstream"
+        if branch in self.names:
+            if self.source == "cache":
+                return "远端有同名分支(上次 fetch 的快照 —— 这轮没连上远端)"
+            return "远端有同名分支"
+        return None
+
+
 # ---------------------------------------------------------------------------
 # steps
 # ---------------------------------------------------------------------------
@@ -191,33 +270,49 @@ def write_if_absent(path, text, report, label, dry_run):
     return True
 
 
-def step_branch(root, cfg, report, worktree_path):
-    """在受保护分支上不干活 —— 这是整个插件的前提。"""
+def step_branch(root, cfg, report, remote, worktree_path):
+    """不在能推到远端的分支上干活 —— 这是整个插件的前提。"""
     branch = current_branch(root)
     protected = cfg.get("branches.protected", DEFAULT_PROTECTED)
     if branch is None:
         report.ask("当前是 detached HEAD,先切到一条分支再来。")
         return 1
-    if branch not in protected:
-        report.ok("当前分支 {0}(不在受保护列表里),就在这儿干活。".format(branch))
+
+    pushable = remote.pushable(branch)
+    if branch in protected:
+        where = "在受保护分支 {0} 上".format(branch)
+    elif pushable:
+        where = "在分支 {0} 上,它能直接推到远端({1})".format(branch, pushable)
+    else:
+        report.ok("当前分支 {0}(推不到远端,也不在 protected 名单里),就在这儿干活。"
+                  .format(branch))
         return 0
 
     if worktree_path:
         # Already being resolved this run -- calling it a pending decision
         # would leave the summary asking for something we are about to do.
-        report.ok("当前在受保护分支 {0},按 --worktree 另开检出。".format(branch))
+        report.ok("当前{0},按 --worktree 另开检出。".format(where))
         return 0
 
     # Where a worktree goes is a real choice (inside the repo? beside it? on
     # another drive?) and guessing it litters someone's disk.
-    report.ask("当前在受保护分支 {0} 上。".format(branch))
-    report.note("在共享分支上直接改,是这套工具存在的原因之一 —— 先开一个 worktree。")
+    report.ask("当前{0}。".format(where))
+    report.note("在能推到远端的分支上放项目无关的东西(工具、文档、AI 产物),"
+                "一次手滑就进了公司仓 —— 先开一个 worktree。")
     report.note("放哪儿我不猜。想好位置后:")
     report.note('  py -3 Keeper.py init --worktree "<路径>" --branch "<新分支名>"')
     return 1
 
 
-def step_make_worktree(root, report, worktree_path, branch_name, dry_run):
+def step_make_worktree(root, report, remote, worktree_path, branch_name, dry_run):
+    # `git worktree add <path>` without -b names the new branch after the
+    # directory, so the name we must vet is not always the one that was typed.
+    effective = branch_name or Path(worktree_path).name
+    pushable = remote.pushable(effective)
+    if pushable:
+        report.ask("新分支 {0} 同样能推到远端({1}),换个只在本机存在的名字。"
+                   .format(effective, pushable))
+        return None, 1
     existing = dict((b, p) for b, p in worktree_list(root))
     if branch_name and branch_name in existing:
         report.ok("分支 {0} 已有 worktree: {1}".format(
@@ -409,14 +504,17 @@ def cmd_init(args):
 
     pending = 0
     report = Report()
-    rc = step_branch(root, cfg, report, args.worktree)
+    remote = RemoteView(root)
+    if remote.source == "cache":
+        report.note("连不上远端,这一轮用的是上次 fetch 的快照(refs/remotes)。")
+    rc = step_branch(root, cfg, report, remote, args.worktree)
     if rc and not args.worktree:
-        # Staying on a protected branch is a stop, not a warning: every later
+        # Staying on a pushable branch is a stop, not a warning: every later
         # step would write into the checkout we just said not to work in.
         _summary(report)
         return 1
     if args.worktree:
-        new_root, rc = step_make_worktree(root, report, args.worktree,
+        new_root, rc = step_make_worktree(root, report, remote, args.worktree,
                                           args.branch, args.dry_run)
         if rc:
             _summary(report)
