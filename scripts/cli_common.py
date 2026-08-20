@@ -249,7 +249,7 @@ def classify_exception(exc):
     if isinstance(exc, CliUsageError):
         return "E_VALIDATION", False
     if isinstance(exc, KeyboardInterrupt):
-        return "E_INTERRUPTED", True
+        return "E_INTERRUPTED", False
     cause = exc.__cause__ or exc.__context__
     if isinstance(cause, PermissionError):
         return "E_PERMISSION", False
@@ -317,8 +317,10 @@ def main(argv=None, sinks=None, *, command, parser_factory, ai_help,
     except KeyboardInterrupt:
         details = _merge_log(None, log_buf)
         if json_mode:
+            details = dict(details) if details else {}
+            details["state_preserved"] = True
             emit_error(sinks.err, "E_INTERRUPTED", "interrupted",
-                       details=details, retryable=True,
+                       details=details, retryable=False,
                        suggestion=SUGGESTIONS.get("E_INTERRUPTED"))
         else:
             sinks.err.write("interrupted\n")

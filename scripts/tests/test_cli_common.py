@@ -191,7 +191,7 @@ class TestClassifyException(unittest.TestCase):
     def test_keyboard_interrupt(self):
         code, retryable = cc.classify_exception(KeyboardInterrupt())
         self.assertEqual(code, "E_INTERRUPTED")
-        self.assertTrue(retryable)
+        self.assertFalse(retryable)
 
     def test_file_not_found_cause(self):
         try:
@@ -369,8 +369,10 @@ class TestDriverExceptionMapping(unittest.TestCase):
                        command=boom_command, parser_factory=_sample_parser,
                        ai_help=SAMPLE_HELP, prog="sample", reconfigure=False)
         self.assertEqual(code, 1)
-        self.assertEqual(_load(err.getvalue())["error"]["code"],
-                         "E_INTERRUPTED")
+        obj = _load(err.getvalue())
+        self.assertEqual(obj["error"]["code"], "E_INTERRUPTED")
+        self.assertFalse(obj["error"]["retryable"])
+        self.assertTrue(obj["error"]["details"]["state_preserved"])
 
 
 class TestProgressBuffering(unittest.TestCase):
