@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import subprocess
 import sys
@@ -682,6 +684,148 @@ class TestWriters(unittest.TestCase):
             after = rh.RepoState(root)
             self.assertEqual(after.frozen, set())
             self.assertIn('Proj/A.uvoptx', after.modified)
+
+
+
+class TestCliSpec(unittest.TestCase):
+    """RepoHygiene 的 CLI-AI 机器通道(信封 / 退出码 / eager ai-help / 异常兜底)。"""
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        code = rh.main(list(argv), sinks=rh.cc.Sinks(out=out, err=err))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_json_scan_success_envelope(self):
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n'})
+        code, out, err = self.run_main('-p', str(root), '--json')
+        self.assertEqual(code, 0)
+        obj = json.loads(out)
+        self.assertTrue(obj['ok'])
+        self.assertIsNone(obj['error'])
+        self.assertIn('repos', obj['data'])
+        self.assertEqual(obj['data']['repos'][0]['root'], str(root))
+        self.assertEqual(err, '')
+        self.assertIn('log', obj['meta'])
+
+    def test_dry_run_json_marks_dry_run(self):
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n'})
+        code, out, err = self.run_main('-p', str(root), '--dry-run', '--json')
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(out)['data']['dry_run'])
+
+    def test_not_found_path_json_envelope(self):
+        tmp = tempfile.mkdtemp()
+        code, out, err = self.run_main(
+            '-p', os.path.join(tmp, 'no-such'), '--json')
+        self.assertEqual(code, 1)
+        self.assertEqual(out, '')
+        obj = json.loads(err)
+        self.assertFalse(obj['ok'])
+        self.assertEqual(obj['error']['code'], 'E_NOT_FOUND')
+
+    def test_non_repo_dir_json_envelope(self):
+        tmp = tempfile.mkdtemp()
+        plain = os.path.join(tmp, 'plain')
+        os.mkdir(plain)
+        code, out, err = self.run_main('-p', plain, '--json')
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)['error']['code'], 'E_NOT_FOUND')
+
+    def test_bad_arg_json_envelope(self):
+        code, out, err = self.run_main('--contract-test-invalid', '--json')
+        self.assertEqual(code, 2)
+        self.assertEqual(out, '')
+        self.assertEqual(json.loads(err)['error']['code'], 'E_VALIDATION')
+
+    def test_bad_arg_human_is_text_not_json(self):
+        code, out, err = self.run_main('--contract-test-invalid')
+        self.assertEqual(code, 2)
+        self.assertEqual(out, '')
+        self.assertIn('error:', err)
+        with self.assertRaises(ValueError):
+            json.loads(err)
+
+    def test_format_json_equiv(self):
+        code, out, err = self.run_main(
+            '--format', 'json', '--contract-test-invalid')
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(err)['error']['code'], 'E_VALIDATION')
+
+    def test_ai_help_eager(self):
+        code, out, err = self.run_main('--contract-test-invalid', '--ai-help')
+        self.assertEqual(code, 0)
+        self.assertIn('name: RepoHygiene', out)
+        self.assertEqual(err, '')
+
+    def test_ai_help_skips_all_processing(self):
+        code, out, err = self.run_main(
+            '-p', os.path.join(tempfile.mkdtemp(), 'nope'), '--ai-help')
+        self.assertEqual(code, 0)
+        self.assertIn('## Quick Reference', out)
+
+    def test_ai_help_respects_terminator(self):
+        code, out, err = self.run_main('--', '--ai-help')
+        self.assertEqual(code, 2)
+        self.assertNotIn('name: RepoHygiene', out)
+
+    def test_human_scan_output_unchanged(self):
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n'})
+        code, out, err = self.run_main('-p', str(root))
+        self.assertEqual(code, 0)
+        self.assertIn('仓库:', out)
+        self.assertIn('以上只是扫描', out)
+        self.assertEqual(err, '')
+
+    def test_git_failure_maps_to_external_tool(self):
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n'})
+
+        def boom(*a, **k):
+            raise rh.cc.ExternalToolError(
+                'E_EXTERNAL_TOOL', 'git failed', details={'tool': 'git'})
+
+        orig = rh.git
+        rh.git = boom
+        try:
+            code, out, err = self.run_main('-p', str(root), '--json')
+        finally:
+            rh.git = orig
+        self.assertEqual(code, 1)
+        self.assertEqual(out, '')
+        obj = json.loads(err)
+        self.assertEqual(obj['error']['code'], 'E_EXTERNAL_TOOL')
+        self.assertEqual(obj['error']['details']['tool'], 'git')
+
+    def test_unexpected_exception_is_internal_not_traceback(self):
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n'})
+
+        def boom(*a, **k):
+            raise ValueError('boom')
+
+        orig = rh.git
+        rh.git = boom
+        try:
+            code, out, err = self.run_main('-p', str(root), '--json')
+        finally:
+            rh.git = orig
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)['error']['code'], 'E_INTERNAL')
+
+        def boom2(*a, **k):
+            raise ValueError('boom2')
+
+        rh.git = boom2
+        try:
+            code2, out2, err2 = self.run_main('-p', str(root))
+        finally:
+            rh.git = orig
+        self.assertEqual(code2, 1)
+        self.assertNotIn('Traceback', err2)
+        self.assertIn('boom2', err2)
 
 
 if __name__ == '__main__':

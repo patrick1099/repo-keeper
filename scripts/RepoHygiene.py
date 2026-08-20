@@ -59,6 +59,8 @@ from toolname import (EXTRA_IGNORE_GLOBAL_NAME,  # noqa: E402
                       EXTRA_IGNORE_PROJECT_NAME, GLOBAL_DIR_NAME,
                       PROJECT_CONFIG_NAME, REANCHOR_EXE, TOOL_NAME)
 
+import cli_common as cc  # noqa: E402
+
 
 # The report is mostly Chinese. Left to the Windows locale default, piping it
 # anywhere re-encodes it to cp936 and the reader sees mojibake.
@@ -258,12 +260,20 @@ NEGATION_MARKER = "# ==== 例外 —— 必须留在文件最后:git 按最后�
 
 def git(args, cwd, check=True):
     """Run git and return stdout as text. Paths come back UTF-8-ish."""
-    proc = subprocess.run(['git'] + list(args), cwd=str(cwd),
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        proc = subprocess.run(['git'] + list(args), cwd=str(cwd),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise cc.ExternalToolError(
+            "找不到 git 可执行文件",
+            details={"tool": "git", "exit_code": None, "stderr_tail": ""}) from exc
     if check and proc.returncode != 0:
-        raise RuntimeError("git {0} failed ({1}): {2}".format(
-            ' '.join(args), proc.returncode,
-            proc.stderr.decode('utf-8', 'replace').strip()))
+        raise cc.ExternalToolError(
+            "git {0} failed ({1}): {2}".format(
+                ' '.join(args), proc.returncode,
+                proc.stderr.decode('utf-8', 'replace').strip()),
+            details={"tool": "git", "exit_code": proc.returncode,
+                     "stderr_tail": proc.stderr.decode('utf-8', 'replace')[-2000:]})
     return proc.stdout.decode('utf-8', 'surrogateescape')
 
 
@@ -1272,9 +1282,11 @@ def iter_repos(root, each):
     return repos
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description="让 git status 只显示代码改动:ignore 规则 + 冻结本机状态文件 + "
+def build_parser():
+    parser = cc.CliFriendlyParser(
+        prog="RepoHygiene",
+        description="LLMs/agents: run 'RepoHygiene --ai-help' for usage guidance. "
+                    "让 git status 只显示代码改动:ignore 规则 + 冻结本机状态文件 + "
                     "修掉换行造成的幻影修改。默认只扫描不写,且只写本机(.git/info/、"
                     ".git/index),一个字节都不进仓库。")
     parser.add_argument('-p', '--path', default='.',
@@ -1307,18 +1319,56 @@ def main(argv=None):
                         help="随 --add-rule:加到本仓库还是跨项目复用(默认 project)")
     parser.add_argument('--dry-run', action='store_true',
                         help="走真实写入路径但不落盘,报告将会发生什么")
+    parser.add_argument('--json', action='store_true',
+                        help="以 JSON 信封输出(与 --format json 等价)")
+    parser.add_argument('--format', choices=('json',), default='json',
+                        help="输出格式:仅支持 json(与 --json 等价)")
+    parser.add_argument('--ai-help', action='store_true',
+                        help="输出 AI 优化的使用说明并退出")
+    return parser
+
+
+def _scan_summary(args, plan, state, shared):
+    return {
+        "root": str(state.root),
+        "action": "scan",
+        "mode": "shared" if shared else "local",
+        "staged_risky": [{"path": p, "why": w} for p, w in plan.staged_risky],
+        "newly_ignored": list(plan.newly_ignored),
+        "auto_rules": [{"pattern": p, "why": w} for p, w in plan.auto_rules],
+        "still_noisy": list(plan.still_noisy),
+        "freeze": [{"path": p, "why": w} for p, w in plan.freeze],
+        "freeze_dirty": list(plan.freeze_dirty),
+        "already_frozen": list(plan.already_frozen),
+        "renormalize": list(plan.renormalize),
+        "review": [{"path": p, "why": w} for p, w in plan.review],
+        "dangerous": [{"line": l, "why": w} for l, w in plan.dangerous],
+        "dead": list(plan.dead),
+        "shadowed": [{"pattern": p, "path": f} for p, f in plan.shadowed],
+    }
+
+
+def command(argv, context):
+    parser = build_parser()
     args = parser.parse_args(argv)
+
+    target = Path(args.path).resolve()
+    if not target.exists():
+        return cc.fail("E_NOT_FOUND",
+                       "路径不存在: {0}".format(target),
+                       details={"path": str(target)})
 
     repos = iter_repos(args.path, args.each)
     if not repos:
-        print("没有找到 git 仓库: {0}".format(Path(args.path).resolve()))
-        return 1
+        return cc.fail("E_NOT_FOUND", "没有找到 git 仓库: {0}".format(target),
+                       details={"path": str(target)})
 
     shared = args.shared or args.write_gitignore
     do_ignore = args.write_ignore or args.write_gitignore or args.apply
     do_freeze = args.freeze or args.apply
     do_renorm = args.renormalize or args.apply
 
+    repo_results = []
     for root in repos:
         if args.add_rule:
             try:
@@ -1327,14 +1377,21 @@ def main(argv=None):
                                              args.rule_layer,
                                              dry_run=args.dry_run)
             except ValueError as exc:
-                print("{0}".format(exc))
-                return 2
+                return cc.fail("E_VALIDATION", str(exc), exit_code=cc.EXIT_ARG)
             print("{0}: {1} -> {2}{3}".format(
                 root, args.add_rule,
                 "已加入 " + str(path) if added else "已经在 {0} 里了".format(path),
                 " (--dry-run,未落盘)" if args.dry_run and added else ""))
             print("规则要生效,还得重写 ignore 文件: RepoHygiene.py -p {0} "
                   "--write-ignore".format(root))
+            repo_results.append({
+                "root": str(root),
+                "action": "add_rule",
+                "rule": args.add_rule,
+                "layer": args.rule_layer,
+                "added": added,
+                "path": str(path),
+            })
             continue
 
         state = RepoState(root)
@@ -1346,10 +1403,16 @@ def main(argv=None):
                 continue
             print("仓库: {0}".format(root))
             apply_unfreeze(state, targets, dry_run=args.dry_run)
+            repo_results.append({
+                "root": str(root),
+                "action": "unfreeze",
+                "targets": list(targets),
+            })
             continue
 
         plan = build_plan(state, auto=not args.no_auto_rules)
         print(describe(plan, shared=shared))
+        repo_results.append(_scan_summary(args, plan, state, shared))
 
         if not (do_ignore or do_freeze or do_renorm):
             continue
@@ -1382,7 +1445,93 @@ def main(argv=None):
         print("  --renormalize       只修 [3] 的幻影修改")
         print("  --apply             三样都做      (加 --dry-run 先预演)")
         print("  --shared            改成写仓库里的 .gitignore / .gitattributes")
-    return 0
+
+    data = {"repos": repo_results}
+    if args.dry_run:
+        data["dry_run"] = True
+    return cc.ok(data)
+
+
+AI_HELP = """---
+name: RepoHygiene
+description: >
+  Make `git status` in an embedded firmware repo show code changes only:
+  write ignore rules, freeze local-only state files with skip-worktree, and
+  fix CRLF phantom-modified files. Use when user asks to clean up a noisy
+  git status / ignore build output / stop tracking uvoptx or RTE_Components.h
+  / fix phantom-modified files / tidy a repo-keeper checkout.
+ai_help_version: 0.1.0
+---
+
+# RepoHygiene AI Help Guide
+
+## Quick Reference
+
+- **Scan a repo (read-only):** `RepoHygiene.py -p <repo> --json`
+- **Apply all fixes locally:** `RepoHygiene.py -p <repo> --apply`
+- **Preview without writing:** `RepoHygiene.py -p <repo> --apply --dry-run`
+
+## When to Use
+
+Use this tool when the user asks to:
+- clean up a `git status` full of build output / IDE state / office lock files
+- stop a tracked local-state file (`*.uvoptx`, `RTE_Components.h`) from showing as modified
+- fix files that show as modified but whose bytes are identical (CRLF phantom)
+- add an ignore rule for a leftover artifact
+
+Do NOT use for:
+- rewriting the shared `.gitignore` without review (pass `--shared` only when the user accepts a reviewable commit)
+
+## Command Reference
+
+- `-p, --path <dir>`: repo to scan (default: current dir)
+- `--each`: treat `--path` as a parent dir and process every repo under it
+- `--shared`: write the shared `.gitignore` / `.gitattributes` instead of `.git/info/`
+- `--write-ignore` / `--write-gitignore`: write ignore rules (default target `.git/info/exclude`)
+- `--freeze`: skip-worktree the tracked local-state files
+- `--renormalize`: fix phantom-modified files and write `-text` attributes
+- `--apply`: do all three above
+- `--unfreeze [PATH...]`: clear skip-worktree (all frozen files when no path)
+- `--add-rule PATTERN --why REASON [--rule-layer project|global]`: add an ignore rule
+- `--dry-run`: preview what a write would do without writing
+- `--json`: machine envelope output (equivalent to `--format json`)
+
+## Input / Output
+
+- `--json` success: `{ok:true, data:{repos:[...], dry_run:true?}, error:null, meta:{log}}`
+- `--json` failure: envelope on stderr, stdout empty; `error.code` from the table below
+- human mode: the existing scan report on stdout, errors on stderr
+
+## Side Effects & Safety
+
+- Default scan writes nothing.
+- Local mode writes `.git/info/exclude`, `.git/info/attributes` and `.git/index` -- never tracked, gone after a fresh clone.
+- `--shared` rewrites tracked `.gitignore` / `.gitattributes` and makes a `.gitignore.bak`; it creates a commit others must review.
+- `--apply` / `--freeze` / `--renormalize` / `--add-rule` are the only writers.
+- `--dry-run` previews without writing (data carries `dry_run: true`).
+
+## Exit Codes
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | runtime failure (see error.code) |
+| 2 | parameter / usage error (E_VALIDATION) |
+
+## Errors & Recovery
+
+| code | meaning | recovery |
+|---|---|---|
+| `E_VALIDATION` | bad argument / refused rule | fix the argument per message |
+| `E_NOT_FOUND` | no git repo at `--path` | point `--path` at a real repo |
+| `E_EXTERNAL_TOOL` | git missing or failed | check git is installed and callable |
+| `E_INTERNAL` | unexpected bug | report it |
+"""
+
+
+def main(argv=None, sinks=None):
+    return cc.main(argv, sinks, command=command, parser_factory=build_parser,
+                   ai_help=AI_HELP, prog="RepoHygiene")
 
 
 if __name__ == '__main__':
