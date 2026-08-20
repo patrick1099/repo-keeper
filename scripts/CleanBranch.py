@@ -20,13 +20,13 @@ CleanBranch.py — 干净分支 <-> 工作分支 对账助手(探测 + 验证)
 
 退出码: 0 = 干净/通过, 1 = 有待办/失败, 2 = 脚本错误/配置缺失
 """
-import argparse
 import os
 import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import local_config  # noqa: E402
+import cli_common as cc  # noqa: E402
 
 # Windows 控制台默认 cp936，强制 UTF-8 输出避免中文乱码 / emoji 编码错误
 for _s in (sys.stdout, sys.stderr):
@@ -104,9 +104,11 @@ def _resolve_worktrees():
         ["git", "-C", os.getcwd(), "worktree", "list", "--porcelain"],
         capture_output=True, encoding="utf-8")
     if r.returncode != 0:
-        sys.stderr.write("需在本仓库的某个 worktree 内运行本脚本。\n"
-                         + (r.stderr or "") + "\n")
-        sys.exit(2)
+        raise cc.ExternalToolError(
+            "E_EXTERNAL_TOOL",
+            "需在本仓库的某个 worktree 内运行本脚本。\n" + (r.stderr or ""),
+            details={"tool": "git", "exit_code": r.returncode,
+                     "stderr_tail": (r.stderr or "").strip()[-2000:]})
     wt_by_branch, cur = {}, None
     for line in r.stdout.splitlines():
         if line.startswith("worktree "):
@@ -119,9 +121,13 @@ def _resolve_worktrees():
     cw, ww = wt_by_branch.get(CLEAN_REF), wt_by_branch.get(WORK_REF)
     missing = [ref for ref, wt in ((CLEAN_REF, cw), (WORK_REF, ww)) if not wt]
     if missing:
-        sys.stderr.write("未在 worktree 列表找到分支: " + ", ".join(missing)
-                         + "\n已知分支: " + ", ".join(wt_by_branch) + "\n")
-        sys.exit(2)
+        raise cc.CliError(
+            "E_VALIDATION",
+            "未在 worktree 列表找到分支: " + ", ".join(missing)
+            + "\n已知分支: " + ", ".join(wt_by_branch),
+            details={"state": "missing_worktree", "missing": missing,
+                     "known_branches": sorted(wt_by_branch)},
+            exit_code=cc.EXIT_ARG)
     return cw, ww
 
 
@@ -149,8 +155,12 @@ def git(wt, *args):
     cmd = ["git", "-C", wt, "-c", "core.quotepath=false", *args]
     r = subprocess.run(cmd, capture_output=True, encoding="utf-8")
     if r.returncode != 0:
-        sys.stderr.write(f"git failed: {' '.join(args)}\n{r.stderr}\n")
-        sys.exit(2)
+        raise cc.ExternalToolError(
+            "E_EXTERNAL_TOOL",
+            f"git failed: {' '.join(args)}\n{r.stderr}",
+            details={"tool": "git", "args": list(args),
+                     "exit_code": r.returncode,
+                     "stderr_tail": (r.stderr or "").strip()[-2000:]})
     return r.stdout.rstrip("\n")
 
 
@@ -411,30 +421,133 @@ def verify():
     return 0 if ok else 1
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(
+def build_parser():
+    parser = cc.CliFriendlyParser(
+        prog="CleanBranch",
         description="干净分支 <-> 工作分支 对账:探测漂移与待搬运的提交,验证三项不变量。"
                     "只报告,不动手。")
     parser.add_argument("action", nargs="?", choices=["detect", "verify"],
                         help="detect=探测待办, verify=不变量 PASS/FAIL")
     local_config.add_explain_flag(parser)
+    parser.add_argument("--json", action="store_true",
+                        help="以 JSON 信封输出(与 --format json 等价)")
+    parser.add_argument("--format", choices=("json",), default="json",
+                        help="输出格式:仅支持 json(与 --json 等价)")
+    parser.add_argument("--ai-help", action="store_true",
+                        help="输出 AI 优化的使用说明并退出")
+    return parser
+
+
+def command(argv, context):
+    parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.explain:
+        try:
+            cfg = configure()
+        except local_config.ConfigError as exc:
+            return cc.fail("E_VALIDATION", str(exc), exit_code=cc.EXIT_ARG)
+        if context.json_mode:
+            return cc.ok(local_config.explain_data(cfg))
+        context.sinks.out.write(cfg.explain() + "\n")
+        return cc.ok()
+
+    if args.action is None:
+        if context.json_mode:
+            return cc.fail("E_VALIDATION",
+                           "需要指定 action: detect 或 verify，或 --explain",
+                           exit_code=cc.EXIT_ARG)
+        parser.print_help()
+        return cc.fail("E_VALIDATION", "", exit_code=cc.EXIT_ARG)
 
     try:
         cfg = configure()
     except local_config.ConfigError as exc:
-        sys.stderr.write(str(exc) + "\n")
-        return 2
+        return cc.fail("E_VALIDATION", str(exc), exit_code=cc.EXIT_ARG)
 
-    if args.explain:
-        print(cfg.explain())
-        return 0
     if args.action == "detect":
-        return detect()
+        rc = detect()
+        return cc.ok({"action": "detect", "pending": rc != 0})
     if args.action == "verify":
-        return verify()
-    parser.print_help()
-    return 2
+        rc = verify()
+        if rc == 0:
+            return cc.ok({"action": "verify", "passed": True})
+        return cc.fail("E_VERIFICATION_FAILED",
+                       "CleanBranch verify 失败:干净分支不变量未通过",
+                       details={"passed": False},
+                       suggestion=cc.SUGGESTIONS.get("E_VERIFICATION_FAILED"),
+                       exit_code=cc.EXIT_FAIL)
+
+
+AI_HELP = """---
+name: CleanBranch
+description: >
+  Reconcile the clean branch (code only, customer-facing) with the work branch
+  (superset: code + docs + tooling) whose histories were rewritten independently
+  and cannot be merged. Detect drift / commits to cherry-pick / stray docs, or
+  verify three invariants. Report only, never mutates. Use when the user asks
+  to reconcile clean vs work branches, check whether the clean branch is clean,
+  or list commits to carry from one branch to the other.
+ai_help_version: 0.1.0
+---
+
+# CleanBranch AI Help Guide
+
+## Quick Reference
+
+- **Detect pending work:** `CleanBranch.py detect --json`
+- **Verify invariants:** `CleanBranch.py verify --json`
+- **Inspect config provenance:** `CleanBranch.py --explain`
+
+## When to Use
+
+Use this tool when the user asks to:
+- reconcile two long-lived branches (clean vs work) that cannot be merged
+- list commits on the clean branch that are still pending on the work branch
+- verify the clean branch keeps only code (no stray docs, no drift)
+
+Do NOT use for:
+- actually cherry-picking (use PickToClean); this tool only reports
+
+## Command Reference
+
+- `detect`: report drift, commits pending on the work branch, stray docs
+- `verify`: check three invariants (code drift / stray docs / main HEAD)
+- `--explain`: print which layer each config value came from, then exit
+- `--json`: machine envelope output (equivalent to `--format json`)
+
+## Input / Output
+
+- `--json` success: `{ok:true, data:{action, pending?|passed?}, error:null, meta:{log}}`
+- `--json` failure: envelope on stderr, stdout empty; `error.code` from the table below
+- human mode: the existing report on stdout, errors on stderr
+
+## Side Effects & Safety
+
+- Report only; never writes or mutates anything.
+
+## Exit Codes
+
+| code | meaning |
+|---|---|
+| 0 | success (detect clean / verify pass) |
+| 1 | runtime failure (see error.code) |
+| 2 | parameter / usage error (E_VALIDATION) |
+
+## Errors & Recovery
+
+| code | meaning | recovery |
+|---|---|---|
+| `E_VALIDATION` | missing clean/work worktree or bad argument | check branches exist as worktrees / fix arguments |
+| `E_EXTERNAL_TOOL` | git failed | check git is installed and callable |
+| `E_VERIFICATION_FAILED` | one of the invariants FAILed | inspect error.details for the failed acceptance |
+| `E_INTERNAL` | unexpected bug | report it |
+"""
+
+
+def main(argv=None, sinks=None):
+    return cc.main(argv, sinks, command=command, parser_factory=build_parser,
+                   ai_help=AI_HELP, prog="CleanBranch")
 
 
 if __name__ == "__main__":

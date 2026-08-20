@@ -33,6 +33,7 @@ from fnmatch import fnmatch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import CleanBranch as cb  # noqa: E402  复用 clean_wt()/DOC_GLOBS/ALLOW（唯一真相源）
 import local_config  # noqa: E402
+import cli_common as cc  # noqa: E402
 
 # Windows 控制台默认 cp936，强制 UTF-8 输出避免中文乱码
 for _s in (sys.stdout, sys.stderr):
@@ -57,11 +58,15 @@ def _run(wt, *args):
 
 
 def _out(wt, *args):
-    """跑 git 且必须成功；成功返回 stdout（去尾换行），失败打印并 exit 2。"""
+    """跑 git 且必须成功；成功返回 stdout（去尾换行），失败抛 ExternalToolError。"""
     r = _run(wt, *args)
     if r.returncode != 0:
-        sys.stderr.write("git 失败: " + " ".join(args) + "\n" + (r.stderr or "") + "\n")
-        sys.exit(2)
+        raise cc.ExternalToolError(
+            "E_EXTERNAL_TOOL",
+            "git 失败: " + " ".join(args) + "\n" + (r.stderr or ""),
+            details={"tool": "git", "args": list(args),
+                     "exit_code": r.returncode,
+                     "stderr_tail": (r.stderr or "").strip()[-2000:]})
     return r.stdout.rstrip("\n")
 
 
@@ -81,10 +86,9 @@ def _conflict_files(wt):
     return [p for p in out.splitlines() if p]
 
 
-def _print_conflict_guidance(wt, src_hash):
-    sys.stdout.flush()   # 否则 stderr 先冲出来，指引会印在前面几条 "picked ..." 之上
+def _conflict_guidance_text(wt, src_hash):
     files = " ".join(_conflict_files(wt)) or "<冲突文件>"
-    msg = (
+    return (
         f"cherry-pick {src_hash} 冲突，现场已保留。\n"
         f"  1) 在干净分支 worktree 手工解冲突（禁止 -X theirs/ours）\n"
         f"  2) git -C {wt} add -A -- {files}\n"
@@ -92,7 +96,6 @@ def _print_conflict_guidance(wt, src_hash):
         f"  4) git -C {wt} commit --amend --reset-author --no-edit   # 作者归一\n"
         f"  5) 重跑本脚本处理剩余 commit\n"
     )
-    sys.stderr.write(msg)
 
 
 def _cherry_pick_in_progress(wt):
@@ -104,49 +107,63 @@ def _check_identity(wt, cfg):
     """确认这个 worktree 会用干净分支该用的身份签名。
 
     没在配置里声明身份就没什么可核对的,跳过 —— 不能因为「没配」拦住所有人。
+    不匹配抛 E_VALIDATION（前置条件不满足），由 cc.main 统一映射 rc2。
     """
     want = cfg.get("identity.clean")
     if not isinstance(want, dict):
-        return 0
+        return
     name = _run(wt, "config", "user.name").stdout.strip()
     email = _run(wt, "config", "user.email").stdout.strip()
     if name == want.get("name") and email == want.get("email"):
-        return 0
-    sys.stderr.write(
+        return
+    raise cc.CliError(
+        "E_VALIDATION",
         "干净分支 worktree 的提交身份与配置不符,拒绝搬运:\n"
         f"  worktree 现在会签: {name or '(未设置)'} <{email or '(未设置)'}>\n"
         f"  配置要求的是:      {want.get('name')} <{want.get('email')}>\n"
         "改配置,或者把 worktree 配对:\n"
         f'  git -C {wt} config --worktree user.name "{want.get("name")}"\n'
         f'  git -C {wt} config --worktree user.email "{want.get("email")}"\n'
-        "(--worktree 需要仓库层 extensions.worktreeConfig=true)\n")
-    return 2
+        "(--worktree 需要仓库层 extensions.worktreeConfig=true)",
+        details={"state": "identity_mismatch", "worktree": wt,
+                 "actual": {"name": name, "email": email},
+                 "expected": {"name": want.get("name"),
+                              "email": want.get("email")}},
+        exit_code=cc.EXIT_ARG)
 
 
 def _preflight(wt, commits, cfg):
-    """全部前置检查，任何一条不过就在动手前返回错误码 (2)；通过返回 0。"""
+    """全部前置检查，任何一条不过就在动手前抛 E_VALIDATION；通过返回 0。"""
     # a. 无进行中的 cherry-pick。
     #    必须排在「工作区干净」前面:一场没收拾的冲突同时让两条都不满足,而先报
     #    「先清理工作区」是把人往错路上指 —— 清理解决不了它,要的是 --abort/--quit。
     if _cherry_pick_in_progress(wt):
-        sys.stderr.write("检测到进行中的 cherry-pick（CHERRY_PICK_HEAD 存在），"
-                         "请先 git cherry-pick --quit/--abort 后再运行。\n")
-        return 2
+        raise cc.CliError(
+            "E_VALIDATION",
+            "检测到进行中的 cherry-pick（CHERRY_PICK_HEAD 存在），"
+            "请先 git cherry-pick --quit/--abort 后再运行。",
+            details={"state": "cherry_pick_in_progress", "worktree": wt},
+            exit_code=cc.EXIT_ARG)
     # b. 工作区必须干净
     status = _out(wt, "status", "--porcelain")
     if status.strip():
-        sys.stderr.write("先清理干净分支 worktree（git status 非空）:\n" + status + "\n")
-        return 2
+        raise cc.CliError(
+            "E_VALIDATION",
+            "先清理干净分支 worktree（git status 非空）:\n" + status,
+            details={"state": "dirty_worktree", "worktree": wt,
+                     "status": status.strip()},
+            exit_code=cc.EXIT_ARG)
     # c. 提交身份必须是干净分支该用的那个
-    rc = _check_identity(wt, cfg)
-    if rc:
-        return rc
+    _check_identity(wt, cfg)
     # d. 每个 commit 都必须能解析（doc 守卫要跑 git show，须先确保 hash 有效）
     for h in commits:
         r = _run(wt, "rev-parse", "--verify", "-q", h + "^{commit}")
         if r.returncode != 0:
-            sys.stderr.write(f"无法解析 commit: {h}\n")
-            return 2
+            raise cc.CliError(
+                "E_VALIDATION", f"无法解析 commit: {h}",
+                details={"state": "unresolvable_commit", "src": h,
+                         "worktree": wt},
+                exit_code=cc.EXIT_ARG)
     # e. 文档守卫：所有 commit 一起预检，任一命中就在动手前退出（列出越界文件）
     offending = []
     for h in commits:
@@ -156,18 +173,44 @@ def _preflight(wt, commits, cfg):
             if p and _is_doc(p) and p not in cb.ALLOW:
                 offending.append(f"{h}: {p}")
     if offending:
-        sys.stderr.write("拒绝：以下 commit 含文档改动（工作分支→干净分支不搬文档）:\n    "
-                         + "\n    ".join(offending) + "\n")
-        return 2
+        raise cc.CliError(
+            "E_VALIDATION",
+            "拒绝：以下 commit 含文档改动（工作分支→干净分支不搬文档）:\n    "
+            + "\n    ".join(offending),
+            details={"state": "doc_guard", "offending": offending,
+                     "worktree": wt},
+            exit_code=cc.EXIT_ARG)
     return 0
 
 
-def _pick_one(wt, src_hash):
+def _would_cherry_pick_be_empty(wt, src_hash):
+    """只读判定：真实 cherry-pick 这条 commit 会不会是空提交。
+
+    dry-run 与真实路径共用同一判据 —— 内容已全部在干净分支 HEAD 上时,
+    cherry-pick 产出的树与 HEAD 相同,即空提交。全程只跑 git diff,不动工作区。
+    """
+    r = _run(wt, "rev-parse", "--verify", "-q", src_hash + "^")
+    if r.returncode != 0:          # 根提交，无父，无从判定
+        return False
+    names = _out(wt, "diff", "--name-only", src_hash + "^", src_hash)
+    paths = [p for p in names.splitlines() if p]
+    if not paths:                  # 没改任何文件 -> 一定是空提交
+        return True
+    q = _run(wt, "diff", "--quiet", "HEAD", src_hash, "--", *paths)
+    return q.returncode == 0
+
+
+def _pick_one(wt, src_hash, dry_run=False):
     """搬一条 commit。返回:
         ("done", new_short_hash) — 已落到干净分支
         ("skip", None)          — 内容与干净分支已一致，pick 出来是空提交
         ("conflict", None)      — 冲突，现场已保留（调用方 exit 1）
+        ("would_pick", None)    — dry-run：会 pick（未落盘）
     """
+    if dry_run:
+        if _would_cherry_pick_be_empty(wt, src_hash):
+            return ("skip", None)
+        return ("would_pick", None)
     # --keep-redundant-commits 不给:内容已在对面时宁可跳过,也不要在对外分支的
     # 记录里留一条什么都没改的提交。
     r = _run(wt, "cherry-pick", src_hash)
@@ -176,7 +219,6 @@ def _pick_one(wt, src_hash):
         if "empty" in combined or "nothing to commit" in combined:
             _run(wt, "cherry-pick", "--skip")
             return ("skip", None)
-        _print_conflict_guidance(wt, src_hash)
         return ("conflict", None)
 
     # 作者归一到本 worktree 的身份（已在 _preflight 核对过与 identity.clean 一致）。
@@ -185,38 +227,161 @@ def _pick_one(wt, src_hash):
     return ("done", _out(wt, "rev-parse", "--short", "HEAD"))
 
 
-def main(argv, cfg=None):
-    if not argv:
-        sys.stderr.write(__doc__)
-        return 2
+def build_parser():
+    parser = cc.CliFriendlyParser(
+        prog="PickToClean",
+        description="把工作分支的 commit 搬到干净分支，先过两道闸（文档守卫 + 身份核对）。")
+    parser.add_argument("commits", nargs="*", metavar="COMMIT",
+                        help="要搬运的 commit hash（旧->新 顺序）")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="预演：判定每个 commit 会 pick 还是 skip，不落盘")
+    parser.add_argument("--json", action="store_true",
+                        help="以 JSON 信封输出(与 --format json 等价)")
+    parser.add_argument("--format", choices=("json",), default="json",
+                        help="输出格式:仅支持 json(与 --json 等价)")
+    parser.add_argument("--ai-help", action="store_true",
+                        help="输出 AI 优化的使用说明并退出")
+    return parser
+
+
+def command(argv, context, cfg=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not args.commits:
+        if context.json_mode:
+            return cc.fail("E_VALIDATION", "缺少要搬运的 commit",
+                           exit_code=cc.EXIT_ARG)
+        context.sinks.err.write(__doc__)
+        return cc.fail("E_VALIDATION", "缺少要搬运的 commit",
+                       exit_code=cc.EXIT_ARG)
 
     if cfg is None:
         try:
             cfg = cb.configure()
         except local_config.ConfigError as exc:
-            sys.stderr.write(str(exc) + "\n")
-            return 2
+            return cc.fail("E_VALIDATION", str(exc), exit_code=cc.EXIT_ARG)
 
     wt = cb.clean_wt()   # 惰性解析（测试通过 CleanBranch._WT_CACHE 注入 fixture）
 
-    rc = _preflight(wt, argv, cfg)
-    if rc != 0:
-        return rc
+    _preflight(wt, args.commits, cfg)
 
-    picked = []
-    for src_hash in argv:      # 旧->新
-        kind, new_hash = _pick_one(wt, src_hash)
+    picked, skipped = [], []
+    for src_hash in args.commits:      # 旧->新
+        kind, new_hash = _pick_one(wt, src_hash, dry_run=args.dry_run)
         if kind == "conflict":
-            return 1
-        elif kind == "skip":
-            print(f"skip {src_hash} (内容已在干净分支，pick 出来是空提交)")
+            guidance = _conflict_guidance_text(wt, src_hash)
+            if context.json_mode:
+                return cc.fail(
+                    "E_EXTERNAL_TOOL", "cherry-pick 冲突，现场已保留",
+                    details={"tool": "git", "state": "conflict",
+                             "worktree": wt, "src": src_hash,
+                             "conflict_files": _conflict_files(wt),
+                             "guidance": guidance},
+                    exit_code=cc.EXIT_FAIL)
+            context.sinks.out.flush()
+            context.sinks.err.write(guidance)
+            return cc.fail("E_EXTERNAL_TOOL", "cherry-pick 冲突，现场已保留",
+                           exit_code=cc.EXIT_FAIL)
+        if kind == "skip":
+            skipped.append({"src": src_hash})
+            print(f"skip {src_hash} (内容已在干净分支，pick 出来是空提交)"
+                  + (" (dry-run,未落盘)" if args.dry_run else ""))
+        elif kind == "would_pick":
+            picked.append({"src": src_hash, "hash": None})
+            print(f"would pick {src_hash} (dry-run,未落盘)")
         else:
-            picked.append((src_hash, new_hash))
+            picked.append({"src": src_hash, "hash": new_hash})
             print(f"picked {new_hash}  <- {src_hash}")
 
-    if picked:
+    if picked and not args.dry_run:
         print("\n下一步跑 CleanBranch.py verify")
-    return 0
+
+    data = {"action": "pick", "worktree": wt,
+            "picked": picked, "skipped": skipped}
+    if args.dry_run:
+        data["dry_run"] = True
+    return cc.ok(data)
+
+
+AI_HELP = """---
+name: PickToClean
+description: >
+  Cherry-pick commits from the work branch onto the clean branch, gated by two
+  guards before anything is touched: a doc guard (no docs may travel to the
+  clean branch) and an identity check (the worktree must sign with the
+  configured clean-branch identity). Conflicts are left in place for manual
+  resolution. Use when the user asks to move commits to the clean branch,
+  apply a commit to the clean side, or preview what a pick would do.
+ai_help_version: 0.1.0
+---
+
+# PickToClean AI Help Guide
+
+## Quick Reference
+
+- **Pick commits:** `PickToClean.py <commit> [<commit> ...]`
+- **Preview without writing:** `PickToClean.py <commit> ... --dry-run`
+- **Machine output:** `PickToClean.py <commit> ... --json`
+
+## When to Use
+
+Use this tool when the user asks to:
+- carry commits from the work branch onto the clean branch
+- apply a commit to the clean side (it cherry-picks + resets the author)
+- preview which commits would land and which would be skipped
+
+Do NOT use for:
+- reporting drift (use CleanBranch detect/verify)
+- committing docs to the clean branch (the doc guard refuses)
+
+## Command Reference
+
+- `COMMIT...`: hashes to move, oldest -> newest
+- `--dry-run`: decide pick vs skip for each commit without mutating anything
+- `--json`: machine envelope output (equivalent to `--format json`)
+
+## Input / Output
+
+- `--json` success: `{ok:true, data:{action, worktree, picked, skipped, dry_run?}, error:null, meta:{log}}`
+- `--json` failure: envelope on stderr, stdout empty; `error.code` from the table below
+- human mode: per-commit progress on stdout, errors / conflict guidance on stderr
+
+## Side Effects & Safety
+
+- Real mode mutates the clean-branch worktree: `git cherry-pick` then
+  `git commit --amend --reset-author --no-edit`.
+- `--dry-run` never mutates: it decides via read-only `git diff` whether each
+  commit would produce a non-empty pick, so nothing lands (data carries
+  `dry_run: true`).
+- Guards run before any mutation: in-progress cherry-pick / dirty worktree /
+  identity mismatch / unresolvable hash / doc-guard violations all refuse up front.
+- On conflict the working tree is left in place for manual resolution, and
+  remaining commits are not processed.
+
+## Exit Codes
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | runtime failure (conflict / git failure) |
+| 2 | parameter / usage / preflight error (E_VALIDATION) |
+
+## Errors & Recovery
+
+| code | meaning | recovery |
+|---|---|---|
+| `E_VALIDATION` | missing commits / preflight guard / config | fix per the message |
+| `E_EXTERNAL_TOOL` | git failed or cherry-pick conflict | resolve conflict in the clean worktree, then re-run |
+| `E_INTERNAL` | unexpected bug | report it |
+"""
+
+
+def main(argv=None, cfg=None, sinks=None):
+    return cc.main(argv, sinks,
+                   command=lambda a, ctx: command(a, ctx, cfg),
+                   parser_factory=build_parser, ai_help=AI_HELP,
+                   prog="PickToClean")
 
 
 if __name__ == "__main__":

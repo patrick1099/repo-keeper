@@ -165,13 +165,14 @@ class CliError(Exception):
     ``isinstance`` before anything else."""
 
     def __init__(self, code, message, details=None, retryable=False,
-                 suggestion=None):
+                 suggestion=None, exit_code=None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.details = details
         self.retryable = retryable
         self.suggestion = suggestion
+        self.exit_code = exit_code
 
 
 class ExternalToolError(CliError, RuntimeError):
@@ -341,6 +342,14 @@ def main(argv=None, sinks=None, *, command, parser_factory, ai_help,
                        retryable=retryable, suggestion=SUGGESTIONS.get(code))
         else:
             sinks.err.write(message + "\n")
+        if isinstance(exc, CliError):
+            # A raised business error keeps its rc semantics: argument-class
+            # codes (E_VALIDATION) exit 2, the rest exit 1. An explicit
+            # ``exit_code`` on the exception wins over the code-based default.
+            exit_code = exc.exit_code
+            if exit_code is None:
+                exit_code = EXIT_ARG if code == "E_VALIDATION" else EXIT_FAIL
+            return exit_code
         return EXIT_FAIL
 
     if json_mode:

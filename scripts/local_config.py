@@ -43,6 +43,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from toolname import (GLOBAL_CONFIG_NAME, GLOBAL_DIR_NAME,  # noqa: E402
                       PROJECT_CONFIG_NAME, TOOL_NAME)
+import cli_common as cc  # noqa: E402
 
 GLOBAL = "global"
 PROJECT = "project"
@@ -293,19 +294,109 @@ def add_explain_flag(parser):
         help="打印每个配置值来自哪一层(全局/项目),然后退出")
 
 
-def main(argv=None):
-    """`python local_config.py [--explain]` -- inspect the merged config."""
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
+def main(argv=None, sinks=None):
+    """`python local_config.py [--explain] [--json]` -- inspect the merged
+    config. Machine channel follows the CLI-AI spec via cli_common."""
+    return cc.main(argv, sinks, command=command, parser_factory=build_parser,
+                   ai_help=AI_HELP, prog="local_config")
+
+
+def explain_data(cfg):
+    """Structured view of the merged config for the JSON channel."""
+    keys = sorted(cfg._origins)
+    return {
+        "sources": {layer: (cfg.sources.get(layer) or None)
+                    for layer in (GLOBAL, PROJECT)},
+        "origins": {key: cfg.origin(key) for key in keys},
+        "config": {key: cfg.get(key) for key in keys},
+    }
+
+
+def build_parser():
+    parser = cc.CliFriendlyParser(
+        prog="local_config",
+        description="查看两层合并后的配置(全局默认 + 项目覆盖),以及每个值来自哪一层。")
+    add_explain_flag(parser)
+    parser.add_argument("--json", action="store_true",
+                        help="以 JSON 信封输出(与 --format json 等价)")
+    parser.add_argument("--format", choices=("json",), default="json",
+                        help="输出格式:仅支持 json(与 --json 等价)")
+    parser.add_argument("--ai-help", action="store_true",
+                        help="输出 AI 优化的使用说明并退出")
+    return parser
+
+
+def command(argv, context):
+    parser = build_parser()
+    parser.parse_args(argv)
     try:
-        print(load().explain())
+        cfg = load()
     except ConfigError as exc:
-        sys.stderr.write(str(exc) + "\n")
-        return 2
-    return 0
+        return cc.fail("E_VALIDATION", str(exc), exit_code=cc.EXIT_ARG)
+    if context.json_mode:
+        return cc.ok(explain_data(cfg))
+    context.sinks.out.write(cfg.explain() + "\n")
+    return cc.ok()
+
+
+AI_HELP = """---
+name: local_config
+description: >
+  Inspect repo-keeper's merged two-layer config (global defaults in
+  ~/.repo-keeper/defaults.toml + per-project overrides in .repo-keeper.local.toml)
+  and show which layer every value came from. Use when the user asks where a
+  config value is set, why a branch ref resolves a certain way, or wants the
+  effective config of the current repo.
+ai_help_version: 0.1.0
+---
+
+# local_config AI Help Guide
+
+## Quick Reference
+
+- **Inspect config (human):** `local_config.py [--explain]`
+- **Inspect config (machine):** `local_config.py --json`
+
+## When to Use
+
+Use this tool when the user asks to:
+- see the effective repo-keeper config (global + project merged)
+- know which layer (global / project) a config key comes from
+- debug why a branch ref / code path resolves a certain way
+
+Do NOT use for:
+- writing config (this tool only reads and explains)
+
+## Command Reference
+
+- `--explain`: print which layer each config value came from, then exit
+- `--json`: machine envelope output (equivalent to `--format json`)
+
+## Input / Output
+
+- `--json` success: `{ok:true, data:{sources, origins, config}, error:null, meta:{}}`
+- `--json` failure: envelope on stderr, stdout empty; `error.code` from the table below
+- human mode: the `explain()` text on stdout, errors on stderr
+
+## Side Effects & Safety
+
+- Read-only: never writes config files.
+
+## Exit Codes
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | runtime failure (see error.code) |
+| 2 | parameter / usage error (E_VALIDATION) |
+
+## Errors & Recovery
+
+| code | meaning | recovery |
+|---|---|---|
+| `E_VALIDATION` | config file missing or malformed | fix the named file per the message |
+| `E_INTERNAL` | unexpected bug | report it |
+"""
 
 
 if __name__ == "__main__":

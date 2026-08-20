@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import subprocess
 import sys
@@ -244,6 +246,95 @@ class TestDiscovery(unittest.TestCase):
         outside = Path(self.tmp.name) / "not-a-repo"
         outside.mkdir()
         self.assertIsNone(lc.project_config_path(outside))
+
+
+class TestCliSpec(unittest.TestCase):
+    """local_config 的 CLI-AI 机器通道(信封 / 退出码 / eager ai-help)。"""
+
+    def fixture_cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        gp = root / "defaults.toml"
+        pp = root / PROJECT_CONFIG_NAME
+        write_toml(gp, '[identity]\nclean = { name = "a", email = "a@example.com" }\n'
+                       '[scan]\ndepth = 60\n')
+        write_toml(pp, '[scan]\ndepth = 5\n[branches]\nclean = "c"\n')
+        return lc.load(global_path=gp, project_path=pp)
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        code = lc.main(list(argv), sinks=lc.cc.Sinks(out=out, err=err))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_json_success_envelope(self):
+        cfg = self.fixture_cfg()
+        orig_load = lc.load
+        lc.load = lambda *a, **k: cfg
+        try:
+            code, out, err = self.run_main("--json")
+        finally:
+            lc.load = orig_load
+        self.assertEqual(code, 0)
+        obj = json.loads(out)
+        self.assertTrue(obj["ok"])
+        self.assertIsNone(obj["error"])
+        self.assertEqual(obj["data"]["config"]["scan.depth"], 5)
+        self.assertEqual(obj["data"]["origins"]["scan.depth"], lc.PROJECT)
+        self.assertEqual(obj["data"]["sources"][lc.PROJECT], str(cfg.sources[lc.PROJECT]))
+        self.assertEqual(err, "")
+
+    def test_human_default_is_explain_text(self):
+        cfg = self.fixture_cfg()
+        orig_load = lc.load
+        lc.load = lambda *a, **k: cfg
+        try:
+            code, out, err = self.run_main()
+        finally:
+            lc.load = orig_load
+        self.assertEqual(code, 0)
+        self.assertIn("配置来源", out)
+        self.assertIn(lc.PROJECT, out)
+        self.assertEqual(err, "")
+
+    def test_ai_help_eager_skips_processing(self):
+        code, out, err = self.run_main("--contract-test-invalid", "--ai-help")
+        self.assertEqual(code, 0)
+        self.assertIn("name: local_config", out)
+        self.assertEqual(err, "")
+
+    def test_ai_help_respects_terminator(self):
+        code, out, err = self.run_main("--", "--ai-help")
+        self.assertEqual(code, 2)
+        self.assertNotIn("name: local_config", out)
+
+    def test_bad_arg_json_envelope(self):
+        code, out, err = self.run_main("--contract-test-invalid", "--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(json.loads(err)["error"]["code"], "E_VALIDATION")
+
+    def test_format_json_equiv(self):
+        code, out, err = self.run_main(
+            "--format", "json", "--contract-test-invalid")
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(err)["error"]["code"], "E_VALIDATION")
+
+    def test_config_error_is_validation_rc2(self):
+        def boom(*a, **k):
+            raise lc.ConfigError("配置缺少 branches.clean")
+        orig_load = lc.load
+        lc.load = boom
+        try:
+            code, out, err = self.run_main("--json")
+        finally:
+            lc.load = orig_load
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        obj = json.loads(err)
+        self.assertFalse(obj["ok"])
+        self.assertEqual(obj["error"]["code"], "E_VALIDATION")
+        self.assertIn("branches.clean", obj["error"]["message"])
 
 
 if __name__ == "__main__":

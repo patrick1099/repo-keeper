@@ -28,6 +28,7 @@ test_clean_branch.py — CleanBranch.py / PickToClean.py 的 stdlib unittest 测
    `_rm_readonly` 处理器先 chmod 再重试。
 """
 import io
+import json
 import os
 import shutil
 import stat
@@ -630,6 +631,105 @@ class PickToCleanTests(BaseCleanBranchTest):
         src = self.repo.commit(FakeRepo.WORK, {"App/Code/x.c": b"int a;\n"}, "add x")
         rc, _out_, err = self._run_pick([src])
         self.assertEqual(rc, 0, err)
+
+
+class CleanBranchCliTests(BaseCleanBranchTest):
+    """CleanBranch 的 CLI-AI 机器通道(信封 / 退出码 / eager ai-help)。
+
+    直接跑 main()/command()：configure() 会去读真实的双层配置，测试里把它
+    monkeypatch 成 no-op —— 模块设置已在 setUp 注入。
+    """
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        orig_configure = cb.configure
+        cb.configure = lambda cfg=None: None
+        try:
+            code = cb.main(list(argv), sinks=cb.cc.Sinks(out=out, err=err))
+        finally:
+            cb.configure = orig_configure
+        return code, out.getvalue(), err.getvalue()
+
+    def test_detect_json_success_envelope(self):
+        code, out, err = self.run_main("detect", "--json")
+        self.assertEqual(code, 0)
+        obj = json.loads(out)
+        self.assertTrue(obj["ok"])
+        self.assertIsNone(obj["error"])
+        self.assertEqual(obj["data"]["action"], "detect")
+        self.assertIn("pending", obj["data"])
+        self.assertEqual(err, "")
+
+    def test_verify_json_pass_envelope(self):
+        code, out, err = self.run_main("verify", "--json")
+        self.assertEqual(code, 0)
+        obj = json.loads(out)
+        self.assertTrue(obj["ok"])
+        self.assertEqual(obj["data"]["action"], "verify")
+        self.assertTrue(obj["data"]["passed"])
+
+    def test_verify_fail_is_verification_failed_rc1(self):
+        self.repo.commit(FakeRepo.CLEAN, {"App/Code/x.c": b"int a;\n"}, "a")
+        self.repo.commit(FakeRepo.WORK, {"App/Code/x.c": b"int b;\n"}, "b")
+        code, out, err = self.run_main("verify", "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        obj = json.loads(err)
+        self.assertFalse(obj["ok"])
+        self.assertEqual(obj["error"]["code"], "E_VERIFICATION_FAILED")
+        self.assertFalse(obj["error"]["details"]["passed"])
+        self.assertIn("log", obj["error"]["details"])
+
+    def test_bad_arg_json_envelope(self):
+        code, out, err = self.run_main("--contract-test-invalid", "--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(json.loads(err)["error"]["code"], "E_VALIDATION")
+
+    def test_format_json_equiv(self):
+        code, out, err = self.run_main(
+            "--format", "json", "--contract-test-invalid")
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(err)["error"]["code"], "E_VALIDATION")
+
+    def test_ai_help_eager(self):
+        code, out, err = self.run_main("--contract-test-invalid", "--ai-help")
+        self.assertEqual(code, 0)
+        self.assertIn("name: CleanBranch", out)
+        self.assertEqual(err, "")
+
+    def test_missing_action_human_shows_help(self):
+        code, out, err = self.run_main()
+        self.assertEqual(code, 2)
+        self.assertIn("usage:", out)
+        self.assertEqual(err, "")
+
+    def test_missing_action_json_is_validation_rc2(self):
+        code, out, err = self.run_main("--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(json.loads(err)["error"]["code"], "E_VALIDATION")
+
+    def test_git_failure_maps_to_external_tool(self):
+        # 机器模式下 _resolve_worktrees 的 git 失败 -> E_EXTERNAL_TOOL + rc1
+        def boom(*a, **k):
+            raise cb.cc.ExternalToolError(
+                "E_EXTERNAL_TOOL", "git failed", details={"tool": "git"})
+
+        orig_resolve = cb._resolve_worktrees
+        cb._resolve_worktrees = boom
+        cb._WT_CACHE = None
+        try:
+            code, out, err = self.run_main("detect", "--json")
+        finally:
+            cb._resolve_worktrees = orig_resolve
+            cb._WT_CACHE = (self.repo.clean_wt, self.repo.work_wt)
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        obj = json.loads(err)
+        self.assertFalse(obj["ok"])
+        self.assertEqual(obj["error"]["code"], "E_EXTERNAL_TOOL")
+        self.assertEqual(obj["error"]["details"]["tool"], "git")
 
 
 if __name__ == "__main__":
