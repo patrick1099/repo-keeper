@@ -64,7 +64,11 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keeper.py" init -p <仓库> --dry-run     #
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keeper.py" init -p <仓库> --no-apply    # 只扫描不写
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keeper.py" init -p <仓库> --worktree "<路径>" --branch <新分支名>
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keeper.py" explain -p <仓库>            # 每个配置值来自哪一层
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keeper.py" init -p <仓库> --json      # 机器通道:stdout 只有 JSON 信封
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keeper.py" --ai-help                  # AI 用法说明(eager,退出 0)
 ```
+
+AI/脚本调用时优先 `--json`（退出码 0/1/2 不变，参数错误也出 `E_VALIDATION` 信封）。
 
 ## init 会自己做的 / 一定不做的
 

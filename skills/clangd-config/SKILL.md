@@ -193,7 +193,7 @@ or a list of what is wrong. What it reads back off disk:
 | `.clangd` and `compile_commands.json` agree on `-D` | **error** | the two files disagreeing can never be legitimate |
 | a real `clang -fsyntax-only` parses two entries | warning | everything above compares the output against itself |
 
-Errors exit **3**. Warnings only print — pass `--verify-strict` to fail on them
+Errors exit **1** (E_VERIFICATION_FAILED). Warnings only print — pass `--verify-strict` to fail on them
 too, `--no-verify` to skip the check entirely.
 
 **The syntax probe is the only check that asks a compiler anything.** Every
@@ -539,7 +539,7 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 | ARMCC `__packed`/`__align` | clangd syntax errors | Add `-D` compat macros |
 | Multiple targets/configurations | Refused, exit 2 | Ask the user, then `-t`/`-c` |
 | Multiple project files under `-p` | Refused, exit 2 (Keil) / 1 (IAR) | `--project <path>` |
-| `.clangd` and the database disagree on `-D` | `verify:` reports an ERROR, exit 3 | Regenerate; do not hand-patch one of the two |
+| `.clangd` and the database disagree on `-D` | `verify:` reports an ERROR, exit 1 | Regenerate; do not hand-patch one of the two |
 | Vendor headers clangd can't parse | `fatal_too_many_errors` | `-ferror-limit=0` (IAR backend does this) |
 | IAR SFR `@ address` declarations | `use of undeclared identifier 'P0'` | Not solved — see the IAR limitation section |
 | Cross-drive paths (C: vs D:) | Relative path fails | Handled, but verify |
@@ -554,12 +554,21 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 
 # Script options
 
+Every backend also exposes a machine channel for scripts / CI / AI agents:
+
+- `--json` — stdout carries exactly one JSON envelope `{ok,data,error,meta}` (UTF-8); logs, progress and errors go to stderr; argument errors still emit an `E_VALIDATION` envelope and exit `2`; JSON mode is non-interactive. `--json` is equivalent to `--format json`.
+- `--ai-help` — eager, exits `0`, prints Markdown with front matter (`name`/`description`/`ai_help_version`); the regular `--help` prints a `LLMs/agents: run ...` line.
+
+A failed `run_verify` (the post-generation self-check) is `E_VERIFICATION_FAILED` and exits `1` — not `3`.
+
 `Proj2Clangd.py`
 ```
 -p, --path PATH       Directory to search (default: current dir)
 --kind {keil,iar,cmake}   Force a backend instead of detecting one
 --detect-only         Report what was found and exit
 <everything else>     Forwarded to the backend
+--json                 Machine channel: single JSON envelope on stdout
+--ai-help              Print AI usage guidance and exit
 ```
 
 `Keil2Clangd.py`
@@ -582,6 +591,8 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 --exe-dest DIR         Put the exe somewhere other than the git repo root
 --dry-run              Report everything, write nothing (honoured by every
                        writer, --fix-placement and the exe included)
+--json                 Machine channel: single JSON envelope on stdout
+--ai-help              Print AI usage guidance and exit
 ```
 
 `Iar2Clangd.py`
@@ -604,6 +615,8 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 --no-syntax-probe     Skip the self-check step that parses entries with clang
                       (distinct from --no-probe, which is the IAR macro probe)
 --list-configs  --no-clangd  --no-compile-commands  --fix-placement  --dry-run
+--json                 Machine channel: single JSON envelope on stdout
+--ai-help              Print AI usage guidance and exit
 ```
 
 `ReAnchor.py`
@@ -611,6 +624,8 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 --root PATH            Search here AND below (default: exe dir / cwd)
 -k/--keil-path PATH    Keil installation, skips the probe
 --dry-run              Report without writing
+--json                 Machine channel: single JSON envelope on stdout
+--ai-help              Print AI usage guidance and exit
 --force                Re-anchor even when the file list does not match
 --ownership-threshold F  Fraction of listed files allowed missing (default 0.10)
 --max-depth N          How deep to search below the root (default 6)
@@ -622,6 +637,8 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 -p PATH  -b/--build-dir PATH  -G/--generator NAME  --cmake PATH
 --cmake-args="..."  --no-configure  -o PATH (pointer .clangd location)
 --no-clangd  --dry-run
+--json                 Machine channel: single JSON envelope on stdout
+--ai-help              Print AI usage guidance and exit
 ```
 
 **`--probe-args` and `--cmake-args` must use `=`.** Their values begin with a

@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "repo-keeper",
   "displayName": "仓库管家(干净分支 + git 噪音治理 + clangd 配置)",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "嵌入式固件仓库的管家,主线只有一句:保住一条干净分支,只让代码提交进去。一个入口 using-repo-keeper,底下四个环节 —— ① 不在能推到远端的分支上干活,先开 worktree(判据不是人维护的名单,而是每次运行现问远端 git ls-remote:远端有同名分支、或本地配了 upstream,就是禁地);② repo-hygiene 让 git status 只剩代码改动;③ clangd-config 从 Keil .uvprojx / IAR .ewp(任意架构)/ CMake 生成并自检 .clangd + compile_commands.json;④ clean-branch 只把代码提交搬进干净分支,搬之前先过文档守卫和提交身份核对两道闸。①②③ 由 Keeper.py 按正确顺序连起来跑(ignore 规则必须在 clangd 之前落地,否则新生成的配置立刻变成一条未跟踪改动),④ 要人现场判断所以只做路由。两条承重原则:**默认一个字节都不进仓库** —— .gitignore/.gitattributes 是从工作分支拉下来的共享文件,改它们会变成同事都要 review 的提交,所以三种修法各有本机形式(.git/info/exclude、.git/info/attributes、.git/index),要动共享文件必须显式 --shared;以及**有歧义一律非零退出,不猜** —— 工程/target/configuration 多选而没指定、必填配置键缺失、worktree 放哪,全都停下来问,因为猜错了会安静地跑在错的东西上并且看起来一切正常。仓库特有的东西(分支 ref、代码路径、白名单、刻意漂移)全在两层 TOML 配置里:全局 ~/.repo-keeper/defaults.toml 跨项目复用,项目 .repo-keeper.local.toml 覆盖它并靠 .git/info/exclude 挡在仓库之外。",
   "author": { "name": "xu" },
   "keywords": ["git", "gitignore", "skip-worktree", "worktree", "cherry-pick",

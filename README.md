@@ -62,6 +62,26 @@ $ py -3 scripts/RepoHygiene.py -p <你的仓库>
 
 `*.uvprojx` 永不冻结：它是真正的工程定义（源文件清单、编译宏、优化等级），改了必须提交。
 
+## AI 调用（机器通道）
+
+所有 12 个脚本都实现了机器通道：`--json` 输出单信封、`--ai-help` 给 AI 用法说明，适合脚本 / CI / AI agent 稳定解析调用。
+
+关键约定：
+
+- `--json` 时 stdout 只有 `{ok,data,error,meta}` 信封（UTF-8），日志/进度/错误全走 stderr
+- 参数错误也出 `E_VALIDATION` 信封并退出 2；JSON 模式无交互
+- `--json` 与 `--format json` 等价
+- 退出码：`0` 成功 / `1` 业务失败（含 `E_VERIFICATION_FAILED` 生成物验收失败）/ `2` 参数·用法错误
+
+```bash
+py -3 scripts/Keeper.py init -p <仓库> --json
+py -3 scripts/RepoHygiene.py -p <仓库> --json
+py -3 scripts/CleanBranch.py detect --json
+py -3 scripts/Proj2Clangd.py -p <目录> --detect-only --json
+```
+
+任何脚本先跑 `--ai-help` 看 AI 用法；主 `--help` 里有 `LLMs/agents: run ...` 一行。
+
 ## 安装
 
 Claude Code 插件：

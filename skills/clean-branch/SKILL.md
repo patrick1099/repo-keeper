@@ -69,7 +69,11 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/CleanBranch.py" verify    # 四项不变量
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/CleanBranch.py" --explain # 每个配置值来自全局层还是项目层
 
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/PickToClean.py" <commit>... # 工作分支→干净分支：过两道闸再 cherry-pick
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/CleanBranch.py" detect --json      # 机器通道:stdout 只有 JSON 信封
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/PickToClean.py" <commit>... --dry-run --json   # 先预演再真跑
 ```
+
+AI/脚本调用优先 `--json`，退出码 0/1/2；`verify` 的 FAIL 是 `E_VERIFICATION_FAILED` + exit 1。
 
 **脚本只探测、只报告 —— 它从不 cherry-pick、从不迁移。** 冲突、迁移方向、白名单例外
 都留给人当场判断。

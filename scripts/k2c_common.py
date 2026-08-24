@@ -44,7 +44,8 @@ REANCHOR_EXE_NAME = REANCHOR_EXE
 # which imports k2c_common and k2c_macroscan. Editing any of them leaves the
 # prebuilt exe behind.
 REANCHOR_EXE_SOURCES = ('ReAnchor.py', 'Keil2Clangd.py', 'k2c_common.py',
-                        'k2c_macroscan.py')
+                        'k2c_macroscan.py',
+                        'cli_common.py')
 
 
 # ---------------------------------------------------------------------------

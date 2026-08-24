@@ -58,6 +58,11 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/RepoHygiene.py" -p <repo> --apply --shared
 
 # 解冻(不给路径 = 全部解冻)
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/RepoHygiene.py" -p <repo> --unfreeze [<路径>...]
+
+# 机器通道(AI/脚本调用)
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/RepoHygiene.py" -p <repo> --json
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/RepoHygiene.py" -p <repo> --apply --dry-run --json   # data.dry_run:true
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/RepoHygiene.py" --ai-help
 ```
 
 `--write-gitignore` 是 `--write-ignore --shared` 的旧写法,保留兼容。
