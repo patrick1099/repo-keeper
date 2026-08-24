@@ -1,4 +1,6 @@
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -63,7 +65,7 @@ class TestCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _touch(Path(tmp) / "app.ewp")
             _touch(Path(tmp) / "CMakeLists.txt")
-            self.assertEqual(detect_mod.main(["-p", tmp]), 1)
+            self.assertEqual(detect_mod.main(["-p", tmp]), 2)
 
     def test_forced_kind_reaches_the_backend(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -73,6 +75,64 @@ class TestCli(unittest.TestCase):
             # ambiguity error, proving the dispatch happened
             self.assertEqual(
                 detect_mod.main(["-p", tmp, "--kind", "cmake", "--no-configure"]), 1)
+
+
+P2C = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "Proj2Clangd.py"
+
+
+def run_cli(*argv):
+    return subprocess.run([sys.executable, str(P2C)] + list(argv),
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+
+class TestJsonCli(unittest.TestCase):
+    def test_detect_only_json_envelope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _touch(Path(tmp) / "app.ewp")
+            r = run_cli("-p", tmp, "--detect-only", "--json")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            obj = json.loads(r.stdout)
+            self.assertTrue(obj["ok"])
+            self.assertEqual(obj["data"]["detected"][0]["kind"], "iar")
+
+    def test_no_project_json_envelope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = run_cli("-p", tmp, "--json")
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertEqual(r.stdout, "")
+            obj = json.loads(r.stderr)
+            self.assertFalse(obj["ok"])
+            self.assertEqual(obj["error"]["code"], "E_NOT_FOUND")
+
+    def test_ambiguous_json_envelope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _touch(Path(tmp) / "app.ewp")
+            _touch(Path(tmp) / "CMakeLists.txt")
+            r = run_cli("-p", tmp, "--json")
+            self.assertEqual(r.returncode, 2, r.stdout)
+            self.assertEqual(r.stdout, "")
+            obj = json.loads(r.stderr)
+            self.assertEqual(obj["error"]["code"], "E_VALIDATION")
+
+    def test_bad_kind_json_envelope(self):
+        r = run_cli("--kind", "bogus", "--json")
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertEqual(r.stdout, "")
+        obj = json.loads(r.stderr)
+        self.assertEqual(obj["error"]["code"], "E_VALIDATION")
+
+    def test_ai_help_eager(self):
+        r = run_cli("--ai-help")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("name: Proj2Clangd", r.stdout)
+        self.assertIn("## Quick Reference", r.stdout)
+
+    def test_format_json_equiv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = run_cli("-p", tmp, "--format", "json")
+            self.assertEqual(r.returncode, 1)
+            obj = json.loads(r.stderr)
+            self.assertEqual(obj["error"]["code"], "E_NOT_FOUND")
 
 
 if __name__ == "__main__":

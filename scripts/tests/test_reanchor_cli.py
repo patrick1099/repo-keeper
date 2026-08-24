@@ -167,5 +167,68 @@ class TestReanchorCliWriteFailure(unittest.TestCase):
         self.assertTrue((self.proj / "compile_commands.json.bak").exists())
 
 
+class TestReanchorCliJson(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.proj = base / "proj"
+        self.proj.mkdir()
+        self.keil = base / "Keil_v5"
+        (self.keil / "ARM" / "ARMCLANG" / "include").mkdir(parents=True)
+        (self.proj / ".clangd").write_text(CLANGD, encoding="utf-8")
+        (self.proj / "App").mkdir()
+        (self.proj / "App" / "main.c").write_text("int main(void){return 0;}\n",
+                                                  encoding="utf-8")
+        args = ["arm-none-eabi-gcc", "-c", "App/main.c",
+                "-IApp/Code", "-ID:/OldKeil/ARM/ARMCLANG/include"]
+        entries = [{"command": " ".join(args), "arguments": args,
+                    "directory": "C:/old-machine/Proj/Code", "file": "App/main.c"}]
+        (self.proj / "compile_commands.json").write_text(
+            json.dumps(entries, indent=4), encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_json_success_envelope(self):
+        r = run_cli("--root", str(self.proj), "--keil-path", str(self.keil), "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        obj = json.loads(r.stdout)
+        self.assertTrue(obj["ok"])
+        self.assertIsNone(obj["error"])
+        self.assertTrue(obj["data"]["changed"] >= 1)
+        self.assertFalse(obj["data"]["dry_run"])
+
+    def test_json_dry_run_flag(self):
+        r = run_cli("--root", str(self.proj), "--keil-path", str(self.keil),
+                    "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        obj = json.loads(r.stdout)
+        self.assertTrue(obj["data"]["dry_run"])
+        self.assertFalse((self.proj / ".clangd.bak").exists())
+
+    def test_json_no_config_envelope(self):
+        empty = Path(self.tmp.name) / "empty"
+        empty.mkdir()
+        r = run_cli("--root", str(empty), "--json")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertEqual(r.stdout, "")
+        obj = json.loads(r.stderr)
+        self.assertFalse(obj["ok"])
+        self.assertEqual(obj["error"]["code"], "E_NOT_FOUND")
+
+    def test_json_bad_arg_envelope(self):
+        r = run_cli("--definitely-not-an-arg", "--json")
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertEqual(r.stdout, "")
+        obj = json.loads(r.stderr)
+        self.assertEqual(obj["error"]["code"], "E_VALIDATION")
+
+    def test_ai_help_eager(self):
+        r = run_cli("--ai-help")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("name: ReAnchor", r.stdout)
+        self.assertIn("## Quick Reference", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,7 +13,6 @@ Before writing anything, the listed file set is checked against the tree -- a
 database copied in from another project is refused rather than "fixed".
 """
 
-import argparse
 import copy
 import json
 import re
@@ -23,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from Keil2Clangd import KeilPathResolver, _dedup  # noqa: E402
+import cli_common as cc
 
 _WIN_ABS_RE = re.compile(r'^[A-Za-z]:[/\\]')
 _ARM_MARKER = '/ARM/'
@@ -334,9 +334,11 @@ class ConfigSite:
         return total
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(
-        description="Re-anchor .clangd / compile_commands.json after moving a project")
+def build_arg_parser():
+    ap = cc.CliFriendlyParser(
+        prog="ReAnchor",
+        description="LLMs/agents: run 'ReAnchor --ai-help' for usage guidance. "
+                    "Re-anchor .clangd / compile_commands.json after moving a project")
     ap.add_argument('--root', default=None,
                     help='Directory to search (default: exe dir / cwd). '
                          'Configs are looked for here AND below.')
@@ -354,15 +356,30 @@ def main(argv=None):
                          .format(_MAX_DEPTH))
     ap.add_argument('--no-pause', action='store_true',
                     help='Do not wait for Enter before exiting (frozen exe)')
-    args = ap.parse_args(argv)
+    ap.add_argument('--json', action='store_true',
+                    help='以 JSON 信封输出(与 --format json 等价)')
+    ap.add_argument('--format', choices=('json',), default='json',
+                    help='输出格式:仅支持 json(与 --json 等价)')
+    ap.add_argument('--ai-help', action='store_true',
+                    help='输出 AI 优化的使用说明并退出')
+    return ap
+
+
+def command(argv, context):
+    args = build_arg_parser().parse_args(argv)
+    json_mode = context.json_mode
 
     root = Path(args.root).resolve() if args.root else _default_root()
     config_dirs = discover_config_dirs(root, max_depth=args.max_depth)
 
     if not config_dirs:
-        print("ERROR: no .clangd or compile_commands.json found in or below "
-              + str(root).replace('\\', '/'))
-        return _finish(1, args)
+        if not json_mode:
+            print("ERROR: no .clangd or compile_commands.json found in or below "
+                  + str(root).replace('\\', '/'))
+        return cc.fail("E_NOT_FOUND",
+                       "ERROR: no .clangd or compile_commands.json found in or below "
+                       + str(root).replace('\\', '/'),
+                       details={"root": str(root).replace('\\', '/')})
 
     sites = [ConfigSite(d) for d in config_dirs]
     if len(sites) > 1:
@@ -376,18 +393,20 @@ def main(argv=None):
         for site in sites:
             err = site.load()
             if err:
-                print("ERROR: " + err)
-                return _finish(1, args)
+                return cc.fail("E_VALIDATION", "ERROR: " + err,
+                               details={"site": str(site.dir)})
 
-        # Ownership gate runs across every site BEFORE any write, so a bad
-        # database cannot be half-applied.
         for site in sites:
             if site.entries is None:
                 continue
             n, missing = check_ownership(site.entries, site.dir)
             if not report_ownership(site.label('compile_commands.json', root),
                                     n, missing, args.ownership_threshold, args.force):
-                return _finish(1, args)
+                return cc.fail("E_VALIDATION",
+                               "compile_commands.json does not belong to this project",
+                               details={"site": str(site.dir),
+                                        "missing": len(missing), "total": n},
+                               suggestion="re-run the clangd-config generator for this project, or pass --force")
 
         dead_found = []
         for site in sites:
@@ -398,7 +417,8 @@ def main(argv=None):
             print("Dead toolchain paths detected:")
             for p in _dedup(dead_found):
                 print("  " + p)
-            keil_root = KeilPathResolver(keil_path=args.keil_path).keil_root
+            keil_root = KeilPathResolver(keil_path=args.keil_path,
+                                         interactive=not json_mode).keil_root
             if keil_root is None:
                 print("WARNING: Keil installation not found -- "
                       "dead toolchain paths will be kept as-is.")
@@ -406,19 +426,102 @@ def main(argv=None):
         for site in sites:
             total += site.apply(keil_root, root, args.dry_run)
     except json.JSONDecodeError as e:
-        print("ERROR: failed to parse compile_commands.json: {0}".format(e))
-        return _finish(1, args)
+        return cc.fail("E_VALIDATION",
+                       "ERROR: failed to parse compile_commands.json: {0}".format(e),
+                       details={"site": str(site.dir)})
     except OSError as e:
-        print("ERROR: file operation failed: {0}".format(e))
-        return _finish(1, args)
+        return cc.fail("E_IO",
+                       "ERROR: file operation failed: {0}".format(e),
+                       details={"site": str(site.dir)})
 
     print("\n{0}: {1} path(s).".format(
         'Would change' if args.dry_run else 'Changed', total))
-    return _finish(0, args)
+    data = {
+        "root": str(root),
+        "sites": [str(s.dir) for s in sites],
+        "changed": total,
+        "dry_run": bool(args.dry_run),
+    }
+    return cc.ok(data)
 
 
-def _finish(rc, args):
-    if getattr(sys, 'frozen', False) and not args.no_pause:
+AI_HELP = """---
+name: ReAnchor
+description: >
+  Surgically re-anchor .clangd / compile_commands.json after a project move:
+  rewrite machine-bound paths (compile_commands 'directory', dead toolchain
+  -I/-imacros) and keep everything else byte-for-byte. Use when user asks to
+  fix clangd configs after moving a project, or a compile_commands.json /
+  .clangd points at dead paths or an old directory.
+ai_help_version: 0.1.0
+---
+
+# ReAnchor AI Help Guide
+
+## Quick Reference
+
+- **Preview what would change:** `ReAnchor.py --root <proj> --dry-run --json`
+- **Re-anchor everything:** `ReAnchor.py --root <proj> --json`
+- **Skip the Keil probe:** `ReAnchor.py --root <proj> -k <keil> --json`
+
+## When to Use
+
+Use this tool when the user asks to:
+- fix .clangd / compile_commands.json after moving a project to another machine
+- re-anchor dead toolchain include paths onto a new Keil install
+- repair clangd config whose 'directory' points at an old location
+
+Do NOT use for:
+- generating a fresh clangd config -- use Keil2Clangd / Iar2Clangd / Cmake2Clangd
+
+## Command Reference
+
+- `--root <dir>`: directory to search; configs are looked for here AND below
+- `-k, --keil-path <dir>`: Keil installation path (skips auto-probe)
+- `--dry-run`: report changes without writing files
+- `--force`: re-anchor even when the file list does not match this project
+- `--ownership-threshold <float>`: fraction of listed files allowed to be missing (default 0.10)
+- `--max-depth <int>`: how deep to search below the root (default 6)
+- `--no-pause`: do not wait for Enter before exiting (frozen exe)
+- `--json`: machine envelope output (equivalent to `--format json`)
+
+## Input / Output
+
+- `--json` success: `{ok:true, data:{root, sites:[...], changed:N, dry_run:bool}, error:null, meta:{log}}`
+- `--json` failure: envelope on stderr, stdout empty; codes below
+
+## Side Effects & Safety
+
+- Rewrites `.clangd` / `compile_commands.json` in place (`.bak` next to each changed file).
+- `--dry-run` writes nothing (`data.dry_run: true`).
+- Refuses (E_VALIDATION) a database that does not belong to this project unless `--force`.
+- `--json` never pauses for Enter (implicit `--no-pause`).
+
+## Exit Codes
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | runtime failure (see error.code) |
+| 2 | parameter / usage error (E_VALIDATION) |
+
+## Errors & Recovery
+
+| code | meaning | recovery |
+|---|---|---|
+| `E_NOT_FOUND` | no .clangd / compile_commands.json under the root | point --root at the project |
+| `E_VALIDATION` | JSON not an array, or database belongs elsewhere | fix the JSON, or re-run the generator / pass --force |
+| `E_IO` | file operation failed (e.g. read-only) | check permissions; .bak is kept |
+"""
+
+
+def main(argv=None, sinks=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    rc = cc.main(argv, sinks, command=command, parser_factory=build_arg_parser,
+                 ai_help=AI_HELP, prog="ReAnchor")
+    if getattr(sys, 'frozen', False) and not cc.json_requested(argv) \
+            and '--no-pause' not in argv:
         try:
             input("\nPress Enter to exit...")
         except EOFError:
