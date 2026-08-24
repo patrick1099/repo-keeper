@@ -1,155 +1,160 @@
-import os
-import json
-import argparse
-import xml.etree.ElementTree as ET
+#!/usr/bin/env python3
+"""Deprecated: forwards to Keil2Clangd.py.
+
+The original Keil2Json.py had no --json mode, always wrote compile_commands.json
+to the current working directory (silently ignoring the project's own
+location), picked the first .uvprojx it found without asking, and returned no
+reliable exit code on error. It only produced compile_commands.json and never
+generated a .clangd.
+
+Keil2Clangd.py replaces it. This shim keeps the old command working; -p and -a
+mean the same thing there, and --no-clangd is applied by default so only
+compile_commands.json is written, matching the old behaviour.
+"""
+
+import sys
 from pathlib import Path
-import shlex
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import cli_common as cc
+import Keil2Clangd
 
 
-class CompileCommandsGenerator:
-    def __init__(self, path=None, absolute=False):
-        self.path = path if path else '.'
-        self.absolute = absolute
-        self.project_root = None
-        self.include_paths = []
-        self.defines = []
-        self.source_files = []
+def build_arg_parser():
+    ap = cc.CliFriendlyParser(
+        prog="Keil2Json",
+        description="(deprecated) forward to Keil2Clangd for compile_commands.json. "
+                    "LLMs/agents: run 'Keil2Json.py --ai-help' for usage guidance.")
+    ap.add_argument('--json', action='store_true',
+                    help='以 JSON 信封输出(与 --format json 等价)')
+    ap.add_argument('--format', choices=('json',), default='json',
+                    help='输出格式:仅支持 json(与 --json 等价)')
+    ap.add_argument('--ai-help', action='store_true',
+                    help='输出 AI 优化的使用说明并退出')
+    return ap
 
-    def parse_uvprojx(self, file_path, project_root):
-        # 解析XML文件
-        tree = ET.parse(file_path)
-        root = tree.getroot()
 
-        # 精确查找 IncludePath 和 Define
-        various_controls = root.find('.//TargetArmAds/Cads/VariousControls')
-        include_paths = []
-        defines = []
+def command(argv, context):
+    if not context.json_mode:
+        context.sinks.err.write(
+            "NOTE: Keil2Json.py is deprecated -- running Keil2Clangd.py "
+            "with --no-clangd instead.\n"
+            "      It fixes silent first-project selection, CWD output, "
+            "missing --json and unreliable exit codes.\n"
+            "      Use Keil2Clangd.py directly for .clangd and other "
+            "options.\n\n")
 
-        if various_controls is not None:
-            # 提取 IncludePath
-            include_elem = various_controls.find('IncludePath')
-            if include_elem is not None and include_elem.text:
-                include_paths = include_elem.text.split(';')
+    if "--no-compile-commands" in argv:
+        return cc.fail("E_VALIDATION",
+                       "Keil2Json always generates compile_commands.json; "
+                       "use Keil2Clangd.py directly for other controls.",
+                       exit_code=cc.EXIT_ARG)
 
-            # 提取 Define
-            define_elem = various_controls.find('Define')
-            if define_elem is not None and define_elem.text:
-                defines = define_elem.text.split(',')
+    forwarded = []
+    if "--no-clangd" not in argv:
+        injected = False
+        for token in argv:
+            if token == "--" and not injected:
+                forwarded.append("--no-clangd")
+                injected = True
+            forwarded.append(token)
+        if not injected:
+            forwarded.append("--no-clangd")
+    else:
+        forwarded = list(argv)
 
-        # 转换IncludePath为绝对路径
-        absolute_include_paths = []
-        for path in include_paths:
-            clean_path = path.strip().replace('\\', '/')
-            if not clean_path:
-                continue
-            # 构建绝对路径
-            abs_path = (project_root / clean_path).resolve()
-            absolute_include_paths.append(str(abs_path).replace('\\', '/'))
+    result = Keil2Clangd.command(forwarded, context)
+    if result.error is None:
+        meta = dict(result.meta) if result.meta else {}
+        meta["deprecated"] = {
+            "replacement": "Keil2Clangd.py --no-clangd",
+            "note": "Keil2Json is deprecated; use Keil2Clangd.py directly for "
+                    ".clangd and other options"}
+        return cc.CliResult(data=result.data, meta=meta,
+                            exit_code=result.exit_code)
+    return result
 
-        # 处理Define中的空格
-        defines = [d.strip() for d in defines if d.strip()]
 
-        # 获取所有源文件路径并转换绝对路径
-        source_files = []
-        for group in root.findall('.//Group'):
-            for file_elem in group.findall('.//File'):
-                file_path_elem = file_elem.find('FilePath')
-                if file_path_elem is not None and file_path_elem.text:
-                    file_path = file_path_elem.text.strip().replace('\\', '/')
-                    # 构建绝对路径
-                    abs_file_path = (project_root / file_path).resolve()
-                    source_files.append(str(abs_file_path).replace('\\', '/'))
+AI_HELP = """---
+name: Keil2Json
+description: >
+  Deprecated shim that generates compile_commands.json from a Keil .uvprojx
+  project by forwarding to Keil2Clangd.py. Use when a legacy caller still
+  invokes Keil2Json.py and expects compile_commands.json only.
+ai_help_version: 0.1.0
+---
 
-        return absolute_include_paths, defines, source_files
+# Keil2Json AI Help Guide
 
-    def generate_entries(self, include_paths, defines, source_files):
-        # 获取 compile_commands.json 所在目录的绝对路径（用于相对路径计算）
-        compile_dir = self.project_root #Path.cwd().resolve()
-        compile_dir_str = str(compile_dir).replace("\\", "/")  # 统一路径分隔符 [[6]]
+## Quick Reference
 
-        # 处理 Include 路径：根据 self.absolute 决定是否转为相对路径
-        processed_include_paths = []
-        for path in include_paths:
-            abs_path = Path(path).resolve()
-            if not self.absolute:
-                try:
-                    # 使用 os.path.relpath 替代 relative_to，支持跨子目录相对路径 [[10]]
-                    rel_path = os.path.relpath(str(abs_path), str(compile_dir))
-                    # 替换路径分隔符为 '/'，确保兼容性 [[4]]
-                    processed_include_paths.append(rel_path.replace("\\", "/"))
-                except ValueError:
-                    # 如果路径跨驱动器（如 C:\ vs D:\），保留绝对路径并替换分隔符 [[10]]
-                    processed_include_paths.append(str(abs_path).replace("\\", "/"))
-            else:
-                # 保留绝对路径并替换分隔符 [[6]]
-                processed_include_paths.append(str(abs_path).replace("\\", "/"))
+- **Generate compile_commands.json:** `Keil2Json.py --project <file.uvprojx> --json`
+- **Search a directory:** `Keil2Json.py -p <dir> --json`
+- **Preview without writing:** `Keil2Json.py -p <dir> --dry-run --json`
 
-        # 构建基础编译参数
-        base_args = [
-            # "-c",
-            "-D__GNUC__",
-        ] + [f"-I{p}" for p in processed_include_paths] + \
-        [f"-D{define}" for define in defines]
-        
-        compiler = "arm-none-eabi-gcc"
-        # 处理源文件路径：根据 self.absolute 决定是否转为相对路径
-        entries = []
-        for file in source_files:
-            file_path = Path(file).resolve()
-            if not self.absolute:
-                try:
-                    # 使用 os.path.relpath 支持跨子目录相对路径 [[10]]
-                    rel_file = os.path.relpath(str(file_path), str(compile_dir))
-                    # 替换路径分隔符为 '/' [[4]]
-                    file_entry = rel_file.replace("\\", "/")
-                except ValueError:
-                    # 如果路径跨驱动器，保留绝对路径 [[10]]
-                    file_entry = str(file_path).replace("\\", "/")
-            else:
-                # 保留绝对路径并替换分隔符 [[6]]
-                file_entry = str(file_path).replace("\\", "/")
+## When to Use
 
-            # command_args = base_args + [file_entry]
-            # command_str = compiler + " " + "-c " + file_entry + " " + "-IC:/Keil_v5/Packs/ARM/CMSIS/5.9.0/CMSIS/Core/Include " + " ".join(shlex.quote(arg) for arg in base_args)
-            command_str = compiler + " " + "-c " + file_entry + " " +  " ".join(shlex.quote(arg) for arg in base_args)
+Use this tool only when an existing script or habit still calls Keil2Json.py
+and only needs compile_commands.json.
 
-            # 构建 JSON 条目
-            entry = {
-                "command": command_str,
-                "arguments": base_args.copy(),
-                "directory": compile_dir_str,  # 始终为绝对路径且分隔符统一 [[6]]
-                "file": file_entry
-            }
-            entries.append(entry)
+Do NOT use for:
+- anything needing `.clangd` (use `Keil2Clangd.py` directly)
+- IAR `.ewp` projects (use `Iar2Clangd.py`)
 
-        return entries
+## Deprecated
 
-    def write_json(self, entries):
-        with open('compile_commands.json', 'w', encoding='utf-8') as f:
-            json.dump(entries, f, indent=4, ensure_ascii=False)
+Keil2Json.py is deprecated; it forwards to Keil2Clangd.py with `--no-clangd`
+always applied, so only compile_commands.json is produced. Behaviour changes
+vs the old script:
 
-    def generate(self):
-        # 查找当前目录下的uvprojx文件
-        uvprojx_files = list(Path(self.path).glob('**/*.uvprojx'))
-        if not uvprojx_files:
-            print("cannot find any .uvprojx file in current directory")
-            return
+1. Output directory defaults to the .uvprojx's own directory, not the CWD
+   (the old unconditional CWD write was a bug and is not preserved). Use
+   `-o/--output` to override.
+2. Multiple .uvprojx files are no longer silently picked in order; an
+   ambiguity gate returns E_VALIDATION (exit 2) and `--project` is required.
+3. Projects with several build targets require `-t/--target-name` (or
+   `--use-first-target` when the choice truly does not matter).
+4. compile_commands.json is upgraded to the canonical clangd format,
+   including .dep enrichment when build output exists.
+5. A post-generation self-check runs by default; failure is reported as
+   E_VERIFICATION_FAILED (exit 1), `--no-verify` skips it.
+6. `--dry-run`, `--json` and `--ai-help` are new.
 
-        # 处理第一个找到的uvprojx文件
-        uvprojx_path = uvprojx_files[0]
-        self.project_root = uvprojx_path.parent.resolve()
-        self.include_paths, self.defines, self.source_files = self.parse_uvprojx(uvprojx_path, self.project_root)
+`--no-clangd` is always implied (this tool only emits compile_commands.json),
+and `--no-compile-commands` is rejected with E_VALIDATION.
 
-        entries = self.generate_entries(self.include_paths, self.defines, self.source_files)
-        self.write_json(entries)
-        print(f"generate complete: compile_commands.json ({'absolute path' if self.absolute else 'relative path'})")
+## Side Effects & Safety
+
+- Writes `compile_commands.json` into the output directory (default: the
+  .uvprojx's own directory).
+- `--dry-run` previews without writing.
+- Self-check runs after generation unless `--no-verify`.
+
+## Exit Codes
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | runtime failure (see error.code) |
+| 2 | parameter / usage error (E_VALIDATION) |
+
+## Errors & Recovery
+
+| code | meaning | recovery |
+|---|---|---|
+| `E_VALIDATION` | bad argument / ambiguous project or target / `--no-compile-commands` | fix the argument, pass `--project` / `-t`, or drop `--no-compile-commands` |
+| `E_NOT_FOUND` | no `.uvprojx`, or `--project` missing | point at a real project file |
+| `E_VERIFICATION_FAILED` | generated files disagree or self-check failed | inspect error.details |
+| `E_INTERNAL` | unexpected bug | report it |
+"""
+
+
+def main(argv=None, sinks=None):
+    return cc.main(argv, sinks, command=command,
+                   parser_factory=lambda: cc.CliFriendlyParser(prog="Keil2Json"),
+                   ai_help=AI_HELP, prog="Keil2Json")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Generate compile_commands.json for vscode')
-    parser.add_argument('--path', '-p', required=False, help='Specify the path of .uvprojx file')
-    parser.add_argument('--absolute', '-a', action='store_true', required=False, help='Format with Absolute path')
-    args = parser.parse_args()
-
-    generator = CompileCommandsGenerator(path=args.path, absolute=args.absolute)
-    generator.generate()
+    raise SystemExit(main())
