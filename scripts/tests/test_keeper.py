@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 import sys
@@ -269,6 +270,32 @@ class TestDryRunAndErrors(KeeperTest):
         self.assertEqual(rc, 0)
         self.assertIn("global", out)
         self.assertIn("project", out)
+
+
+class TestJsonChannel(KeeperTest):
+    """Keeper 的 --json 信封通道:成功走 stdout 单信封,失败走 stderr E_VALIDATION。"""
+
+    def test_json_init_success_envelope(self):
+        _git(["checkout", "-q", "-b", "task/x"], self.root)
+        rc, out, err = self.run_keeper("init", "-p", str(self.root), "--json")
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        obj = json.loads(out)
+        self.assertTrue(obj["ok"])
+        self.assertIsNone(obj["error"])
+        self.assertIn("log", obj["meta"])
+        self.assertEqual(
+            {"root", "done", "todo", "pending"}, set(obj["data"].keys()))
+
+    def test_json_init_non_repo_validation(self):
+        outside = self.base / "nope"
+        outside.mkdir()
+        rc, out, err = self.run_keeper("init", "-p", str(outside), "--json")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        obj = json.loads(err)
+        self.assertFalse(obj["ok"])
+        self.assertEqual(obj["error"]["code"], "E_VALIDATION")
 
 
 if __name__ == "__main__":

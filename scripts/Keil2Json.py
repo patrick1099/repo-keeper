@@ -24,8 +24,8 @@ import Keil2Clangd
 def build_arg_parser():
     ap = cc.CliFriendlyParser(
         prog="Keil2Json",
-        description="(deprecated) forward to Keil2Clangd for compile_commands.json. "
-                    "LLMs/agents: run 'Keil2Json.py --ai-help' for usage guidance.")
+        description="LLMs/agents: run 'Keil2Json --ai-help' for usage guidance. "
+                    "(deprecated) forward to Keil2Clangd for compile_commands.json.")
     ap.add_argument('--json', action='store_true',
                     help='以 JSON 信封输出(与 --format json 等价)')
     ap.add_argument('--format', choices=('json',), default='json',
@@ -36,6 +36,10 @@ def build_arg_parser():
 
 
 def command(argv, context):
+    if "--help" in argv and "--" not in argv:
+        build_arg_parser().print_help()
+        return cc.CliResult(exit_code=0)
+
     if not context.json_mode:
         context.sinks.err.write(
             "NOTE: Keil2Json.py is deprecated -- running Keil2Clangd.py "

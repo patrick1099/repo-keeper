@@ -1043,8 +1043,8 @@ def _split_probe_args(raw):
 def build_arg_parser():
     ap = cc.CliFriendlyParser(
         prog="Iar2Clangd",
-        description="Generate .clangd and compile_commands.json from an IAR .ewp. "
-                    "LLMs/agents: run 'Iar2Clangd.py --ai-help' for usage guidance.")
+        description="LLMs/agents: run 'Iar2Clangd --ai-help' for usage guidance. "
+                    "Generate .clangd and compile_commands.json from an IAR .ewp.")
     ap.add_argument('-p', '--path', default='.',
                     help='Search path for the .ewp file (default: current dir)')
     ap.add_argument('--project', default=None,

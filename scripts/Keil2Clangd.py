@@ -889,8 +889,8 @@ def _refuse_ambiguous_target(uvprojx_path, target_names, json_mode=False):
 def build_arg_parser():
     ap = cc.CliFriendlyParser(
         prog="Keil2Clangd",
-        description="Generate .clangd and compile_commands.json from Keil .uvprojx. "
-                    "LLMs/agents: run 'Keil2Clangd.py --ai-help' for usage guidance.")
+        description="LLMs/agents: run 'Keil2Clangd --ai-help' for usage guidance. "
+                    "Generate .clangd and compile_commands.json from Keil .uvprojx.")
     ap.add_argument('-p', '--path', default='.',
                     help='Search path for .uvprojx file (default: current dir)')
     ap.add_argument('-a', '--absolute', action='store_true',

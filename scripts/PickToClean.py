@@ -230,7 +230,8 @@ def _pick_one(wt, src_hash, dry_run=False):
 def build_parser():
     parser = cc.CliFriendlyParser(
         prog="PickToClean",
-        description="把工作分支的 commit 搬到干净分支，先过两道闸（文档守卫 + 身份核对）。")
+        description="LLMs/agents: run 'PickToClean --ai-help' for usage guidance. "
+                    "把工作分支的 commit 搬到干净分支，先过两道闸（文档守卫 + 身份核对）。")
     parser.add_argument("commits", nargs="*", metavar="COMMIT",
                         help="要搬运的 commit hash（旧->新 顺序）")
     parser.add_argument("--dry-run", action="store_true",

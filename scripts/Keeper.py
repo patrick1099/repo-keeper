@@ -22,13 +22,13 @@ clean-branch job (conflicts and migration direction are judgement, not steps).
 
 Exit codes: 0 = 就绪, 1 = 有需要你决定的事, 2 = 出错。
 """
-import argparse
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cli_common as cc  # noqa: E402
 import local_config  # noqa: E402
 import Proj2Clangd  # noqa: E402
 import RepoHygiene  # noqa: E402
@@ -350,14 +350,15 @@ def step_configs(root, report, dry_run):
         report, "项目配置", dry_run)
 
 
-def step_hygiene(root, report, dry_run, apply_writes):
+def step_hygiene(root, report, dry_run, apply_writes, context):
     print("")
     argv = ["-p", str(root)]
     if apply_writes:
         argv.append("--apply")       # 注意:不带 --shared,共享文件一个字节不动
     if dry_run:
         argv.append("--dry-run")
-    rc = RepoHygiene.main(argv)
+    result = RepoHygiene.command(argv, context)
+    rc = _result_rc(result)
     if rc:
         report.ask("repo-hygiene 没跑完(退出码 {0}),看上面的输出。".format(rc))
         return 1
@@ -410,7 +411,7 @@ def _report_reanchor_exe(root, report, projects):
                "看上面这一步的输出是哪一步卡住了。".format(REANCHOR_EXE))
 
 
-def step_clangd(root, report, dry_run):
+def step_clangd(root, report, dry_run, context):
     print("")
     found = Proj2Clangd.detect(root)
     if not found:
@@ -437,7 +438,8 @@ def step_clangd(root, report, dry_run):
             # databases from landing on top of each other.
             argv += ["--project", str(project)]
         print("")
-        rc = Proj2Clangd.main(argv)
+        result = Proj2Clangd.command(argv, context)
+        rc = _result_rc(result)
         if rc:
             stuck.append((kind, project, rc))
 
@@ -485,75 +487,22 @@ def step_clean_branch(root, report):
 # CLI
 # ---------------------------------------------------------------------------
 
-def cmd_init(args):
-    start = Path(args.path).resolve()
-    root = repo_root(start)
-    if not root:
-        sys.stderr.write("{0} 不在 git 仓库里。\n".format(start))
-        return 2
-
-    print("=" * 70)
-    print("{0} init: {1}".format(TOOL_NAME, root))
-    print("=" * 70)
-
-    try:
-        cfg = local_config.load(start=root)
-    except local_config.ConfigError as exc:
-        sys.stderr.write(str(exc) + "\n")
-        return 2
-
-    pending = 0
-    report = Report()
-    remote = RemoteView(root)
-    if remote.source == "cache":
-        report.note("连不上远端,这一轮用的是上次 fetch 的快照(refs/remotes)。")
-    rc = step_branch(root, cfg, report, remote, args.worktree)
-    if rc and not args.worktree:
-        # Staying on a pushable branch is a stop, not a warning: every later
-        # step would write into the checkout we just said not to work in.
-        _summary(report)
-        return 1
-    if args.worktree:
-        new_root, rc = step_make_worktree(root, report, remote, args.worktree,
-                                          args.branch, args.dry_run)
-        if rc:
-            _summary(report)
-            return 1
-        root = new_root
-        print("")
-        print("以下步骤在新 worktree 里进行: {0}".format(root))
-
-    step_configs(root, report, args.dry_run)
-    pending += step_hygiene(root, report, args.dry_run, not args.no_apply)
-    pending += step_clangd(root, report, args.dry_run)
-    step_clean_branch(root, report)
-    _summary(report)
-    return 1 if (pending or report.todo) else 0
+def _add_common_flags(ap):
+    ap.add_argument("--json", action="store_true",
+                    help="以 JSON 信封输出(与 --format json 等价)")
+    ap.add_argument("--format", choices=("json",), default="json",
+                    help="输出格式:仅支持 json(与 --json 等价)")
+    ap.add_argument("--ai-help", action="store_true",
+                    help="输出 AI 优化的使用说明并退出")
 
 
-def _summary(report):
-    print("")
-    print("=" * 70)
-    print("做完 {0} 件,需要你决定 {1} 件".format(len(report.done), len(report.todo)))
-    for item in report.todo:
-        print("  - " + item)
-    print("=" * 70)
-
-
-def cmd_explain(args):
-    try:
-        print(local_config.load(start=args.path).explain())
-    except local_config.ConfigError as exc:
-        sys.stderr.write(str(exc) + "\n")
-        return 2
-    return 0
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(
-        prog="Keeper.py",
-        description="{0} 的总入口:一条命令把仓库配置好,"
-                    "需要人判断的一律报告不做。".format(TOOL_NAME))
+def build_arg_parser():
+    parser = cc.CliFriendlyParser(
+        prog="Keeper",
+        description="{0} 的总入口:一条命令把仓库配置好,需要人判断的一律报告不做。"
+                    "LLMs/agents: run 'Keeper --ai-help' for usage guidance."
+                    .format(TOOL_NAME))
+    _add_common_flags(parser)
     sub = parser.add_subparsers(dest="cmd")
 
     p = sub.add_parser("init", help="配置这个仓库(生成配置 + 治理 git 噪音 + clangd)")
@@ -566,18 +515,175 @@ def main(argv=None):
                    help="只扫描不写(默认会写本机那几处:.git/info/、.git/index)")
     p.add_argument("--dry-run", action="store_true",
                    help="走真实路径但不落盘,报告将会发生什么")
+    _add_common_flags(p)
     p.set_defaults(func=cmd_init)
 
     p2 = sub.add_parser("explain", help="每个配置值来自全局层还是项目层")
     p2.add_argument("-p", "--path", default=".")
+    _add_common_flags(p2)
     p2.set_defaults(func=cmd_explain)
 
+    return parser
+
+
+def _result_rc(result):
+    return result.exit_code if result.exit_code is not None \
+        else (0 if result.error is None else 1)
+
+
+def command(argv, context):
+    parser = build_arg_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):
-        parser.print_help()
-        return 2
-    return args.func(args)
+        return cc.fail("E_VALIDATION", "缺少子命令,可用 init 或 explain",
+                       exit_code=cc.EXIT_ARG)
+    return args.func(args, context)
+
+
+def _init_result(root, report, pending):
+    return cc.CliResult(
+        data={"root": str(root), "done": report.done, "todo": report.todo,
+              "pending": pending},
+        exit_code=1 if (pending or report.todo) else 0)
+
+
+def cmd_init(args, context):
+    start = Path(args.path).resolve()
+    root = repo_root(start)
+    if not root:
+        return cc.fail("E_VALIDATION", "{0} 不在 git 仓库里。".format(start),
+                       exit_code=cc.EXIT_ARG)
+
+    print("=" * 70)
+    print("{0} init: {1}".format(TOOL_NAME, root))
+    print("=" * 70)
+
+    try:
+        cfg = local_config.load(start=root)
+    except local_config.ConfigError as exc:
+        return cc.fail("E_VALIDATION", str(exc), exit_code=cc.EXIT_ARG)
+
+    pending = 0
+    report = Report()
+    remote = RemoteView(root)
+    if remote.source == "cache":
+        report.note("连不上远端,这一轮用的是上次 fetch 的快照(refs/remotes)。")
+    rc = step_branch(root, cfg, report, remote, args.worktree)
+    if rc and not args.worktree:
+        # Staying on a pushable branch is a stop, not a warning: every later
+        # step would write into the checkout we just said not to work in.
+        _summary(report)
+        return _init_result(root, report, pending)
+    if args.worktree:
+        new_root, rc = step_make_worktree(root, report, remote, args.worktree,
+                                          args.branch, args.dry_run)
+        if rc:
+            _summary(report)
+            return _init_result(root, report, pending)
+        root = new_root
+        print("")
+        print("以下步骤在新 worktree 里进行: {0}".format(root))
+
+    step_configs(root, report, args.dry_run)
+    pending += step_hygiene(root, report, args.dry_run, not args.no_apply,
+                            context)
+    pending += step_clangd(root, report, args.dry_run, context)
+    step_clean_branch(root, report)
+    _summary(report)
+    return _init_result(root, report, pending)
+
+
+def _summary(report):
+    print("")
+    print("=" * 70)
+    print("做完 {0} 件,需要你决定 {1} 件".format(len(report.done), len(report.todo)))
+    for item in report.todo:
+        print("  - " + item)
+    print("=" * 70)
+
+
+def cmd_explain(args, context):
+    try:
+        text = local_config.load(start=args.path).explain()
+    except local_config.ConfigError as exc:
+        return cc.fail("E_VALIDATION", str(exc), exit_code=cc.EXIT_ARG)
+    print(text)
+    return cc.ok({"explain": text, "path": str(Path(args.path).resolve())})
+
+
+AI_HELP = """---
+name: Keeper
+description: >
+  One command that sets a repo up: generate config templates, write ignore
+  rules, freeze IDE state, generate clangd config -- everything per-clone and
+  reversible -- and report (never auto-do) what needs a human. Use when the
+  user asks to set a repo up once (Keeper init), or to see which layer a
+  config value came from (Keeper explain).
+ai_help_version: 0.1.0
+---
+
+# Keeper AI Help Guide
+
+## Quick Reference
+
+- **Set up a repo (machine):** `Keeper.py init -p <repo> --json`
+- **Set up a repo (human):** `Keeper.py init -p <repo>`
+- **See where each config value comes from:** `Keeper.py explain -p <repo> --json`
+
+## When to Use
+
+Use this tool when the user asks to:
+- set a repo up in one step: config templates + ignore rules + freeze IDE state + clangd config
+- prepare a checkout without touching the shared branch
+
+Do NOT use for:
+- the individual stages -- call RepoHygiene / Proj2Clangd / CleanBranch directly
+
+## Command Reference
+
+- `init -p <repo>`: generate configs, run repo-hygiene, generate clangd config
+- `init --worktree <path> --branch <name>`: create a worktree for the work first
+- `init --dry-run`: run the real path but write nothing
+- `init --no-apply`: scan only; do not write ignore rules / freeze / renormalize
+- `explain -p <repo>`: print which layer (global / project) each config value came from
+
+## Input / Output
+
+- `--json` success: `{ok:true, data:{root, done, todo, pending}, error:null, meta:{log}}`
+- `--json` failure: envelope on stderr, stdout empty; `error.code` from the table below
+- human mode: the existing report on stdout, errors on stderr
+
+## Side Effects & Safety
+
+- `init` writes only per-clone, reversible state: `~/.repo-keeper/defaults.toml`,
+  `<repo>/.repo-keeper.local.toml`, `.git/info/` and `.git/index`. Never tracked files.
+- Never rewrites a shared `.gitignore` (RepoHygiene runs in local mode only).
+- `--dry-run` / `--no-apply` write nothing.
+- Everything that needs a judgement stays a report: worktree location, clean-branch job.
+
+## Exit Codes
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | a step reported something for you to decide (see data.todo / data.pending) |
+| 2 | parameter / usage error (E_VALIDATION) |
+
+## Errors & Recovery
+
+| code | meaning | recovery |
+|---|---|---|
+| `E_VALIDATION` | not in a git repo / bad argument / config error | fix the argument or config per the message |
+| `E_NOT_FOUND` | a stage found nothing it needed | point the stage at the right path |
+| `E_EXTERNAL_TOOL` | git or a sub-tool failed | check the external tool |
+| `E_INTERNAL` | unexpected bug | report it |
+"""
+
+
+def main(argv=None, sinks=None):
+    return cc.main(argv, sinks, command=command, parser_factory=build_arg_parser,
+                   ai_help=AI_HELP, prog="Keeper")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

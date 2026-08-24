@@ -424,7 +424,8 @@ def verify():
 def build_parser():
     parser = cc.CliFriendlyParser(
         prog="CleanBranch",
-        description="干净分支 <-> 工作分支 对账:探测漂移与待搬运的提交,验证三项不变量。"
+        description="LLMs/agents: run 'CleanBranch --ai-help' for usage guidance. "
+                    "干净分支 <-> 工作分支 对账:探测漂移与待搬运的提交,验证三项不变量。"
                     "只报告,不动手。")
     parser.add_argument("action", nargs="?", choices=["detect", "verify"],
                         help="detect=探测待办, verify=不变量 PASS/FAIL")

@@ -315,7 +315,8 @@ def explain_data(cfg):
 def build_parser():
     parser = cc.CliFriendlyParser(
         prog="local_config",
-        description="查看两层合并后的配置(全局默认 + 项目覆盖),以及每个值来自哪一层。")
+        description="LLMs/agents: run 'local_config --ai-help' for usage guidance. "
+                    "查看两层合并后的配置(全局默认 + 项目覆盖),以及每个值来自哪一层。")
     add_explain_flag(parser)
     parser.add_argument("--json", action="store_true",
                         help="以 JSON 信封输出(与 --format json 等价)")
