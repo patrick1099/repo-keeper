@@ -152,7 +152,7 @@ class TestRecursiveDiscovery(unittest.TestCase):
         empty.mkdir()
         r = run_cli("--root", str(empty))
         self.assertEqual(r.returncode, 1)
-        self.assertIn("no .clangd or compile_commands.json", r.stdout)
+        self.assertIn("no .clangd or compile_commands.json", r.stderr)
 
     def test_dry_run_across_several_sites_writes_nothing(self):
         before = (self.app / "compile_commands.json").read_text(encoding="utf-8")

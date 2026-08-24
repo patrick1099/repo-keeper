@@ -373,9 +373,6 @@ def command(argv, context):
     config_dirs = discover_config_dirs(root, max_depth=args.max_depth)
 
     if not config_dirs:
-        if not json_mode:
-            print("ERROR: no .clangd or compile_commands.json found in or below "
-                  + str(root).replace('\\', '/'))
         return cc.fail("E_NOT_FOUND",
                        "ERROR: no .clangd or compile_commands.json found in or below "
                        + str(root).replace('\\', '/'),
