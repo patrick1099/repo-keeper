@@ -17,6 +17,7 @@ from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import cli_common as cc
 import k2c_common as common
 import k2c_macroscan as macroscan
 
@@ -343,7 +344,7 @@ class DepParser:
 class KeilPathResolver:
     """Locate Keil installation and resolve compiler / pack include paths."""
 
-    def __init__(self, keil_path=None):
+    def __init__(self, keil_path=None, interactive=True):
         self.keil_root = None
 
         # 1. Explicit CLI path
@@ -372,7 +373,8 @@ class KeilPathResolver:
                 return
 
         # 5. Interactive prompt
-        self._prompt_and_save()
+        if interactive:
+            self._prompt_and_save()
 
     _load_config = staticmethod(common.load_config)
     _save_config = staticmethod(common.save_config)
@@ -818,19 +820,47 @@ def check_macros(parser, keil_resolver, cc_arm=False):
 # refusal lives here instead of in the skill prose.
 # ---------------------------------------------------------------------------
 
-def _refuse_ambiguous_project(uvprojx_files, search_path):
-    """Refuse to guess between several .uvprojx. Returns the exit code."""
+def _refuse_ambiguous_project(uvprojx_files, search_path, json_mode=False):
+    """Refuse to guess between several .uvprojx. Returns a CliResult."""
+    if json_mode:
+        return cc.fail(
+            "E_VALIDATION",
+            "{0} .uvprojx files found under {1}; pass --project to choose one"
+            .format(len(uvprojx_files), search_path),
+            details={
+                "candidates": [str(p) for p in uvprojx_files],
+                "suggestion": '--project "{0}"'.format(uvprojx_files[0]),
+            },
+            exit_code=cc.EXIT_ARG)
     print(f"ERROR: {len(uvprojx_files)} .uvprojx files found under "
           f"{search_path}; refusing to guess.", file=sys.stderr)
     for p in uvprojx_files:
         print(f"  {p}", file=sys.stderr)
     print("\nPick one and pass it explicitly:", file=sys.stderr)
     print(f'  --project "{uvprojx_files[0]}"', file=sys.stderr)
-    return 2
+    return cc.fail("E_VALIDATION", "", exit_code=cc.EXIT_ARG)
 
 
-def _refuse_ambiguous_target(uvprojx_path, target_names):
-    """Refuse to guess between several targets. Returns the exit code."""
+def _refuse_ambiguous_target(uvprojx_path, target_names, json_mode=False):
+    """Refuse to guess between several targets. Returns a CliResult."""
+    if json_mode:
+        targets = []
+        for name in target_names:
+            try:
+                defines = UvprojxParser(str(uvprojx_path),
+                                        target_name=name).get_defines()
+            except Exception:
+                defines = []
+            targets.append({"target": name, "macros": list(defines)})
+        return cc.fail(
+            "E_VALIDATION",
+            "{0} has {1} build targets and no -t was given; pass -t"
+            .format(uvprojx_path.name, len(target_names)),
+            details={
+                "targets": targets,
+                "suggestion": '-t "{0}"'.format(target_names[0]),
+            },
+            exit_code=cc.EXIT_ARG)
     print(f"ERROR: {uvprojx_path.name} has {len(target_names)} build targets "
           f"and no -t was given; refusing to guess.", file=sys.stderr)
     print("Targets differ in macros, so the wrong one indexes the wrong "
@@ -849,17 +879,18 @@ def _refuse_ambiguous_target(uvprojx_path, target_names):
     print("\nUse --dry-run to inspect targets without writing, or "
           "--use-first-target only when the choice genuinely does not matter.",
           file=sys.stderr)
-    return 2
+    return cc.fail("E_VALIDATION", "", exit_code=cc.EXIT_ARG)
 
 
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(
-        description="Generate .clangd and compile_commands.json from Keil .uvprojx"
-    )
+def build_arg_parser():
+    ap = cc.CliFriendlyParser(
+        prog="Keil2Clangd",
+        description="Generate .clangd and compile_commands.json from Keil .uvprojx. "
+                    "LLMs/agents: run 'Keil2Clangd.py --ai-help' for usage guidance.")
     ap.add_argument('-p', '--path', default='.',
                     help='Search path for .uvprojx file (default: current dir)')
     ap.add_argument('-a', '--absolute', action='store_true',
@@ -880,11 +911,6 @@ def main(argv=None):
                     help='Skip compile_commands.json generation')
     ap.add_argument('--dry-run', action='store_true',
                     help='Print info without writing any files')
-    # Defaulting to the process CWD made -o silently decoupled from -p: a caller
-    # that pointed -p at a project and ran from somewhere else got a database
-    # dropped wherever it happened to stand, and with two projects in one repo
-    # the second run would land on top of the first. The project's own directory
-    # is the one default that is a function of what was asked for.
     ap.add_argument('-o', '--output', default=None,
                     help="Output directory (default: the .uvprojx's own "
                          "directory)")
@@ -920,25 +946,35 @@ def main(argv=None):
                     help='Directory for {0} '
                          '(default: the git repo root above the output dir)'
                          .format(common.REANCHOR_EXE_NAME))
+    ap.add_argument('--json', action='store_true',
+                    help='以 JSON 信封输出(与 --format json 等价)')
+    ap.add_argument('--format', choices=('json',), default='json',
+                    help='输出格式:仅支持 json(与 --json 等价)')
+    ap.add_argument('--ai-help', action='store_true',
+                    help='输出 AI 优化的使用说明并退出')
+    return ap
 
-    args = ap.parse_args(argv)
+
+def command(argv, context):
+    args = build_arg_parser().parse_args(argv)
 
     # Find .uvprojx file
     if args.project:
         uvprojx_path = Path(args.project).resolve()
         if not uvprojx_path.is_file():
-            print(f"ERROR: --project does not exist: {uvprojx_path}",
-                  file=sys.stderr)
-            return 1
+            return cc.fail("E_NOT_FOUND",
+                           "ERROR: --project does not exist: {0}".format(uvprojx_path),
+                           details={"path": str(uvprojx_path)})
     else:
         search_path = Path(args.path).resolve()
         uvprojx_files = sorted(search_path.glob('**/*.uvprojx'))
         if not uvprojx_files:
-            print(f"ERROR: No .uvprojx file found under {search_path}",
-                  file=sys.stderr)
-            return 1
+            return cc.fail("E_NOT_FOUND",
+                           "ERROR: No .uvprojx file found under {0}".format(search_path),
+                           details={"path": str(search_path)})
         if len(uvprojx_files) > 1:
-            return _refuse_ambiguous_project(uvprojx_files, search_path)
+            return _refuse_ambiguous_project(uvprojx_files, search_path,
+                                             json_mode=context.json_mode)
         uvprojx_path = uvprojx_files[0]
     print(f"Using: {uvprojx_path}")
 
@@ -947,13 +983,15 @@ def main(argv=None):
     if args.target_name is None and not args.use_first_target:
         all_targets = UvprojxParser(str(uvprojx_path)).list_targets()
         if len(all_targets) > 1 and not args.dry_run:
-            return _refuse_ambiguous_target(uvprojx_path, all_targets)
+            return _refuse_ambiguous_target(uvprojx_path, all_targets,
+                                            json_mode=context.json_mode)
 
     # Parse
     parser = UvprojxParser(str(uvprojx_path), target_name=args.target_name)
 
     # Resolve Keil
-    keil = KeilPathResolver(keil_path=args.keil_path)
+    keil = KeilPathResolver(keil_path=args.keil_path,
+                            interactive=not context.json_mode)
 
     # Output directory
     if args.output is None:
@@ -993,11 +1031,13 @@ def main(argv=None):
         macroscan.report(sources, known_macros,
                          base_dir=Path(uvprojx_path).parent)
 
+    generated = []
     placement = common.check_placement(output_dir, sources)
     print(placement.describe())
     if not placement.ok and args.fix_placement and placement.anchor:
         common.write_pointer_clangd(output_dir, placement.anchor,
                                     dry_run=args.dry_run)
+        generated.append(str(Path(placement.anchor) / '.clangd'))
     elif not placement.ok:
         print("  (re-run with --fix-placement to write that pointer automatically)")
 
@@ -1009,6 +1049,7 @@ def main(argv=None):
                               enrichment=enrichment,
                               cc_arm=args.cc_arm)
         gen.write(output_dir, dry_run=args.dry_run)
+        generated.append(str(output_dir / '.clangd'))
 
     if not args.no_compile_commands:
         gen = CompileCommandsGenerator(parser, keil,
@@ -1017,20 +1058,133 @@ def main(argv=None):
                                        enrichment=enrichment,
                                        cc_arm=args.cc_arm)
         gen.write(output_dir, dry_run=args.dry_run)
+        generated.append(str(output_dir / 'compile_commands.json'))
 
     if not args.no_exe:
         root = (Path(args.exe_dest).resolve() if args.exe_dest
                 else common.find_project_root(output_dir, sources))
-        common.deploy_reanchor_exe(root, dry_run=args.dry_run,
-                                   auto_build=not args.no_build_exe)
+        exe_dest = common.deploy_reanchor_exe(root, dry_run=args.dry_run,
+                                              auto_build=not args.no_build_exe)
+        if exe_dest is not None:
+            generated.append(str(exe_dest))
 
+    data = {
+        "project": str(uvprojx_path),
+        "target": parser.get_target_name(),
+        "output_dir": str(output_dir),
+        "generated": generated,
+    }
     if args.dry_run:
+        data["dry_run"] = True
         print("--dry-run: no files written.")
-        return 0
+        return cc.ok(data)
 
-    return common.run_verify(output_dir, no_verify=args.no_verify,
-                             strict=args.verify_strict,
-                             probe=not args.no_syntax_probe)
+    ok, report = common.run_verify(output_dir, no_verify=args.no_verify,
+                                   strict=args.verify_strict,
+                                   probe=not args.no_syntax_probe)
+    if report is not None:
+        data["verify"] = {
+            "ok": ok,
+            "errors": list(report.errors),
+            "warnings": list(report.warnings),
+            "notes": list(report.notes),
+        }
+    if not ok:
+        return cc.fail(
+            "E_VERIFICATION_FAILED", "post-generation self-check failed",
+            details={
+                "errors": list(report.errors),
+                "warnings": list(report.warnings),
+                "notes": list(report.notes),
+                "strict": args.verify_strict,
+                "summary": "{0} error(s), {1} warning(s)".format(
+                    len(report.errors), len(report.warnings)),
+            })
+    return cc.ok(data)
+
+
+AI_HELP = """---
+name: Keil2Clangd
+description: >
+  Generate .clangd and compile_commands.json from a Keil .uvprojx project for
+  clangd. Use when user asks to set up clangd jump/completion/diagnostics for
+  a Keil MDK project, or mentions .uvprojx / Keil v5/v6 / ARMCC / armclang.
+ai_help_version: 0.1.0
+---
+
+# Keil2Clangd AI Help Guide
+
+## Quick Reference
+
+- **Generate from a project:** `Keil2Clangd.py --project <file.uvprojx> --json`
+- **Search a directory:** `Keil2Clangd.py -p <dir> --json`
+- **Preview without writing:** `Keil2Clangd.py -p <dir> --dry-run`
+
+## When to Use
+
+Use this tool when the user asks to:
+- set up clangd for a Keil MDK project (`.uvprojx`)
+- fix cross-file jump-to-definition that silently fails
+- regenerate `.clangd` / `compile_commands.json` after editing the project
+
+Do NOT use for:
+- IAR `.ewp` projects (use `Iar2Clangd.py`)
+- CMake projects (use `Cmake2Clangd.py`)
+
+## Command Reference
+
+- `-p, --path <dir>`: search path for a single `.uvprojx` (default: current dir)
+- `--project <file>`: explicit `.uvprojx` path, skipping the search
+- `-t, --target-name <name>`: build target to generate for
+- `--use-first-target`: accept the first XML target without asking
+- `-a, --absolute`: absolute paths in the generated files
+- `-o, --output <dir>`: output directory (default: the project's own dir)
+- `-k, --keil-path <dir>`: Keil installation path
+- `--cc-arm`: define `__CC_ARM` (AC5 only; off by default)
+- `--no-clangd` / `--no-compile-commands`: skip one of the two artifacts
+- `--fix-placement`: write a pointer `.clangd` when the output dir is a sibling of the sources
+- `--scan-hidden-macros`: report macros the sources test that no target defines
+- `--no-verify` / `--verify-strict` / `--no-syntax-probe`: self-check controls
+- `--no-exe` / `--no-build-exe` / `--exe-dest <dir>`: re-anchor exe controls
+- `--dry-run`: preview without writing
+- `--json`: machine envelope output (equivalent to `--format json`)
+
+## Input / Output
+
+- `--json` success: `{ok:true, data:{project, target, output_dir, generated, verify, dry_run?}, error:null, meta:{log}}`
+- `--json` failure: envelope on stderr, stdout empty; `error.code` from the table below
+- human mode: the existing report on stdout, errors on stderr
+
+## Side Effects & Safety
+
+- Writes `.clangd` and `compile_commands.json` under the output dir by default.
+- `--fix-placement` writes a pointer `.clangd` at the sources' common ancestor.
+- Deploys the re-anchor exe to the project root unless `--no-exe` (may invoke PyInstaller unless `--no-build-exe`).
+- `--dry-run` previews without writing (data carries `dry_run: true`).
+
+## Exit Codes
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | runtime failure (see error.code) |
+| 2 | parameter / usage error (E_VALIDATION) |
+
+## Errors & Recovery
+
+| code | meaning | recovery |
+|---|---|---|
+| `E_VALIDATION` | bad argument / ambiguous project or target | fix the argument, or pass `--project` / `-t` |
+| `E_NOT_FOUND` | no `.uvprojx`, or `--project` missing | point at a real project file |
+| `E_VERIFICATION_FAILED` | generated files disagree or self-check failed | inspect error.details |
+| `E_INTERNAL` | unexpected bug | report it |
+"""
+
+
+def main(argv=None, sinks=None):
+    return cc.main(argv, sinks, command=command,
+                   parser_factory=build_arg_parser, ai_help=AI_HELP,
+                   prog="Keil2Clangd")
 
 
 if __name__ == '__main__':

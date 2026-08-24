@@ -29,6 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import k2c_common as common
 
+import cli_common as cc
+
 
 DB_NAME = 'compile_commands.json'
 
@@ -177,8 +179,10 @@ class Database:
 # ---------------------------------------------------------------------------
 
 def build_arg_parser():
-    ap = argparse.ArgumentParser(
-        description="Configure a CMake project and make its compile database "
+    ap = cc.CliFriendlyParser(
+        prog="Cmake2Clangd",
+        description="LLMs/agents: run 'Cmake2Clangd --ai-help' for usage guidance. "
+                    "Configure a CMake project and make its compile database "
                     "discoverable by clangd")
     ap.add_argument('-p', '--path', default='.',
                     help='Project directory to start from (default: current dir)')
@@ -200,6 +204,12 @@ def build_arg_parser():
                     help='Only report; do not write a .clangd')
     ap.add_argument('--dry-run', action='store_true',
                     help='Print the analysis without writing or configuring')
+    ap.add_argument('--json', action='store_true',
+                    help='以 JSON 信封输出(与 --format json 等价)')
+    ap.add_argument('--format', choices=('json',), default='json',
+                    help='输出格式:仅支持 json(与 --json 等价)')
+    ap.add_argument('--ai-help', action='store_true',
+                    help='输出 AI 优化的使用说明并退出')
     return ap
 
 
@@ -226,14 +236,15 @@ def _split(raw):
     return shlex.split(raw)
 
 
-def main(argv=None):
+def command(argv, context):
     args = build_arg_parser().parse_args(argv)
 
     source_root = find_source_root(args.path)
     if source_root is None:
-        print("ERROR: no CMakeLists.txt at or below {0}".format(
-            Path(args.path).resolve()))
-        return 1
+        return cc.fail("E_NOT_FOUND",
+                       "ERROR: no CMakeLists.txt at or below {0}".format(
+                           Path(args.path).resolve()),
+                       details={"search_path": str(Path(args.path).resolve())})
     print("Source root: {0}".format(source_root))
 
     build_dir = Path(args.build_dir).resolve() if args.build_dir \
@@ -263,10 +274,10 @@ def main(argv=None):
             result = configure(cmake_exe, source_root, build_dir, generator,
                                _split(args.cmake_args))
             if not result.ok:
-                print("ERROR: configure failed -- {0}".format(result.reason))
                 for line in result.output.splitlines()[-15:]:
                     print("  | {0}".format(line))
-                if _looks_like_compiler_check_failure(result.output):
+                compiler_check = _looks_like_compiler_check_failure(result.output)
+                if compiler_check:
                     print()
                     print("  This looks like CMake's compiler check failing at the")
                     print("  LINK step, not a problem with the project. That is the")
@@ -274,7 +285,16 @@ def main(argv=None):
                     print("  no MSVC/SDK libraries installed. Make the check")
                     print("  compile-only and try again:")
                     print('    --cmake-args="-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY"')
-                return 1
+                return cc.fail(
+                    "E_EXTERNAL_TOOL",
+                    "ERROR: cmake configure failed -- {0}".format(result.reason),
+                    details={
+                        "tool": "cmake",
+                        "reason": result.reason,
+                        "output_tail": result.output.splitlines()[-15:],
+                    },
+                    suggestion=('--cmake-args="-DCMAKE_TRY_COMPILE_TARGET_TYPE='
+                                'STATIC_LIBRARY"' if compiler_check else None))
             print("  cmake configure OK ({0})".format(generator or 'default generator'))
 
     # --- locate the database ---------------------------------------------
@@ -282,10 +302,12 @@ def main(argv=None):
     if db_path is None:
         db_path = find_database(source_root)
     if db_path is None:
-        print("ERROR: no {0} found under {1}.".format(DB_NAME, source_root))
-        print("  Configure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON and a "
-              "generator that supports it (Ninja, Makefiles).")
-        return 1
+        return cc.fail(
+            "E_NOT_FOUND",
+            "ERROR: no {0} found under {1}.".format(DB_NAME, source_root),
+            details={"source_root": str(source_root)},
+            suggestion="Configure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON and a "
+                       "generator that supports it (Ninja, Makefiles)")
     print("Database:    {0}".format(db_path))
 
     database = Database(db_path)
@@ -312,25 +334,115 @@ def main(argv=None):
     placement = common.check_placement(database.directory, sources)
     print(placement.describe())
 
+    data = {
+        "source_root": str(source_root),
+        "build_dir": str(build_dir),
+        "database": str(db_path),
+        "entries": len(database.entries),
+        "sources": len(set(sources)),
+        "placement_ok": placement.ok,
+    }
     if args.dry_run:
+        data["dry_run"] = True
         print("--dry-run: nothing written.")
-        return 0
+        return cc.ok(data)
     if args.no_clangd:
-        return 0
+        return cc.ok(data)
 
     if placement.ok:
         print("No pointer needed: clangd finds {0} from the sources on its own."
               .format(DB_NAME))
-        return 0
+        return cc.ok(data)
 
     anchor = Path(args.output).resolve() if args.output else placement.anchor
     if anchor is None:
-        print("ERROR: sources span several drives; no single anchor exists. "
-              "Pass -o explicitly.")
-        return 1
+        return cc.fail(
+            "E_VALIDATION",
+            "ERROR: sources span several drives; no single anchor exists. "
+            "Pass -o explicitly.",
+            details={"reason": "sources_span_drives"},
+            exit_code=cc.EXIT_ARG,
+            suggestion="-o <dir>")
     common.write_pointer_clangd(database.directory, anchor)
     print("Restart clangd: Ctrl+Shift+P -> 'clangd: Restart language server'")
-    return 0
+    data["anchor"] = str(anchor)
+    data["pointer_written"] = True
+    return cc.ok(data)
+
+
+AI_HELP = """---
+name: Cmake2Clangd
+description: >
+  Configure a CMake project with the compile-commands export switch on and drop
+  a pointer .clangd so clangd can discover the database. Use when user asks to
+  set up clangd for a CMake project, or mentions compile_commands.json / cmake
+  build + clangd jump not working.
+ai_help_version: 0.1.0
+---
+
+# Cmake2Clangd AI Help Guide
+
+## Quick Reference
+
+- **Analyze a project:** `Cmake2Clangd.py -p <src> --json`
+- **Configure + pointer .clangd:** `Cmake2Clangd.py -p <src> --dry-run`
+- **Use an existing database:** `Cmake2Clangd.py -p <src> --no-configure`
+
+## When to Use
+
+Use this tool when the user asks to:
+- set up clangd jump-to-definition for a CMake project
+- make a `compile_commands.json` discoverable from the sources
+- fix cross-file navigation silently failing in a CMake project
+
+Do NOT use for:
+- Keil (.uvprojx) or IAR (.ewp) projects -- use Keil2Clangd / Iar2Clangd
+
+## Command Reference
+
+- `-p, --path <dir>`: project directory to start from (default: current dir)
+- `-b, --build-dir <dir>`: build directory (default: `<source root>/build`)
+- `-G, --generator <name>`: CMake generator (default: Ninja when available)
+- `--cmake <path>`: cmake executable
+- `--cmake-args=<args>`: extra arguments for the configure step
+- `--no-configure`: use an existing compile database, do not run cmake
+- `-o, --output <dir>`: where to write the pointer .clangd
+- `--no-clangd`: only report; do not write a .clangd
+- `--dry-run`: analyze without configuring or writing
+- `--json`: machine envelope output (equivalent to `--format json`)
+
+## Input / Output
+
+- `--json` success: `{ok:true, data:{source_root, build_dir, database, entries,
+  sources, placement_ok, dry_run?}, error:null, meta:{log}}`
+- `--json` failure: envelope on stderr, stdout empty; codes below
+
+## Side Effects & Safety
+
+- Runs `cmake` to configure (skipped by `--no-configure` / `--dry-run`).
+- Writes a pointer `.clangd` unless `--no-clangd` or placement is already OK.
+- Idempotent: re-running converges; `--dry-run` never writes.
+
+## Exit Codes
+
+- 0 success
+- 1 runtime failure (E_NOT_FOUND / E_EXTERNAL_TOOL)
+- 2 parameter / usage error (E_VALIDATION)
+
+## Errors & Recovery
+
+| error.code | meaning | fix |
+|---|---|---|
+| E_NOT_FOUND | no CMakeLists.txt or no compile database | point `-p` at the source root; enable export on configure |
+| E_EXTERNAL_TOOL | cmake configure failed | inspect error.details.output_tail; use the suggested `--cmake-args` |
+| E_VALIDATION | sources span drives without `-o` | pass `-o <dir>` |
+"""
+
+
+def main(argv=None, sinks=None):
+    return cc.main(argv, sinks, command=command,
+                   parser_factory=build_arg_parser,
+                   ai_help=AI_HELP, prog="Cmake2Clangd")
 
 
 if __name__ == '__main__':

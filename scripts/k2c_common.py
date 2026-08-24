@@ -855,17 +855,14 @@ def verify_output(output_dir, probe=True):
 
 
 def run_verify(output_dir, no_verify=False, strict=False, probe=True):
-    """Verify a freshly generated config and return the process exit code.
+    """Verify a freshly generated config and return ``(ok, report)``.
 
     Runs by default. An opt-in check is one a hurried caller simply omits,
     which is the failure this whole section exists to stop.
     """
     if no_verify:
-        return 0
+        return True, None
     report = verify_output(output_dir, probe=probe)
     print(report.describe(strict=strict))
-    if report.errors:
-        return 3
-    if strict and report.warnings:
-        return 3
-    return 0
+    ok = report.ok and not (strict and report.warnings)
+    return ok, report

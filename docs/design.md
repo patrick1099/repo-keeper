@@ -58,7 +58,8 @@ CRLF 工作区 + LF blob 会算出相同 hash，于是把一个真有差异的�
 任何报错。`--fix-placement` 在源码的最近公共祖先写一个指针 `.clangd`。
 
 **生成后默认自检：** 每个 `-I` 是否存在、每个源文件是否存在、`directory` 是否为绝对路径、
-`.clangd` 与 `compile_commands.json` 的 `-D` 是否一致（后两者不一致即 exit 3）。
+`.clangd` 与 `compile_commands.json` 的 `-D` 是否一致。失败即 exit 1，JSON 信封错误码
+`E_VERIFICATION_FAILED`，details 带 errors/warnings 摘要。
 
 ## 配置合并语义
 

@@ -206,7 +206,7 @@ class TestIarConfigGate(unittest.TestCase):
             ewp_project(sub, "app.ewp")
 
             r = run_iar("-p", tmp, "-o", tmp, "-c", "Debug")
-            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertEqual(r.returncode, 2, r.stdout)
             self.assertFalse((Path(tmp) / ".clangd").exists())
             self.assertIn("boot.ewp", r.stderr)
             self.assertIn("--project", r.stderr)
@@ -263,7 +263,7 @@ class TestVerify(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             proj = self._project(tmp, all_sources=False)
             r = run("-p", str(proj), "-o", str(proj), "--verify-strict")
-            self.assertEqual(r.returncode, 3, r.stdout)
+            self.assertEqual(r.returncode, 1, r.stdout)
 
     def test_macro_disagreement_is_an_error(self):
         """A -D in one file but not the other can never be legitimate."""

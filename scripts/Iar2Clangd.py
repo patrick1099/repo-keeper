@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import cli_common as cc
 import k2c_common as common
 import k2c_macroscan as macroscan
 from toolname import TOOL_NAME
@@ -958,9 +959,11 @@ def generate(parser, resolver, args, ewp_path=None):
 
     placement = common.check_placement(output_dir, sources)
     print(placement.describe())
+    generated = []
     if not placement.ok and args.fix_placement and placement.anchor:
         common.write_pointer_clangd(output_dir, placement.anchor,
                                     dry_run=args.dry_run)
+        generated.append(str(Path(placement.anchor) / '.clangd'))
     elif not placement.ok:
         print("  (re-run with --fix-placement to write that pointer automatically)")
     print()
@@ -978,6 +981,7 @@ def generate(parser, resolver, args, ewp_path=None):
                                      parser.get_compiler_id(), undefs),
                 encoding='utf-8')
             print("Generated: {0}".format(predef_header))
+        generated.append(str(predef_header))
 
     flags = IarFlags(parser, resolver, probe, predef_header, output_dir,
                      use_absolute=args.absolute, triple=triple)
@@ -987,24 +991,42 @@ def generate(parser, resolver, args, ewp_path=None):
         for comment, group_flags in flags.groups():
             doc.add_group(comment, group_flags)
         doc.write(output_dir, dry_run=args.dry_run)
+        generated.append(str(output_dir / '.clangd'))
 
     if not args.no_compile_commands:
         entries = common.make_compile_entries(
             "arm-none-eabi-gcc" if (parser.get_toolchain() or '').upper() == 'ARM' else "clang",
             flags.flat_args(), sources, output_dir, use_absolute=args.absolute)
         common.write_compile_commands(entries, output_dir, dry_run=args.dry_run)
+        generated.append(str(output_dir / 'compile_commands.json'))
 
     # No re-anchor exe here on purpose: ReAnchor only understands Keil layouts.
     # A moved IAR project is re-generated instead -- Iar2Clangd re-probes the
     # compiler anyway, so re-anchoring would buy nothing.
 
+    data = {
+        "project": str(ewp_path),
+        "config": parser.get_config_name(),
+        "toolchain": parser.get_toolchain(),
+        "output_dir": str(output_dir),
+        "generated": generated,
+    }
     if args.dry_run:
+        data["dry_run"] = True
         print("--dry-run: no files written.")
-        return 0
+        return data, True, None
 
-    return common.run_verify(output_dir, no_verify=args.no_verify,
-                             strict=args.verify_strict,
-                             probe=not args.no_syntax_probe)
+    ok, vreport = common.run_verify(output_dir, no_verify=args.no_verify,
+                                    strict=args.verify_strict,
+                                    probe=not args.no_syntax_probe)
+    if vreport is not None:
+        data["verify"] = {
+            "ok": ok,
+            "errors": list(vreport.errors),
+            "warnings": list(vreport.warnings),
+            "notes": list(vreport.notes),
+        }
+    return data, ok, vreport
 
 
 def _split_probe_args(raw):
@@ -1019,8 +1041,10 @@ def _split_probe_args(raw):
 # ---------------------------------------------------------------------------
 
 def build_arg_parser():
-    ap = argparse.ArgumentParser(
-        description="Generate .clangd and compile_commands.json from an IAR .ewp")
+    ap = cc.CliFriendlyParser(
+        prog="Iar2Clangd",
+        description="Generate .clangd and compile_commands.json from an IAR .ewp. "
+                    "LLMs/agents: run 'Iar2Clangd.py --ai-help' for usage guidance.")
     ap.add_argument('-p', '--path', default='.',
                     help='Search path for the .ewp file (default: current dir)')
     ap.add_argument('--project', default=None,
@@ -1075,38 +1099,68 @@ def build_arg_parser():
                          'entries with a real clang')
     ap.add_argument('--dry-run', action='store_true',
                     help='Print the analysis without writing files')
+    ap.add_argument('--json', action='store_true',
+                    help='以 JSON 信封输出(与 --format json 等价)')
+    ap.add_argument('--format', choices=('json',), default='json',
+                    help='输出格式:仅支持 json(与 --json 等价)')
+    ap.add_argument('--ai-help', action='store_true',
+                    help='输出 AI 优化的使用说明并退出')
     return ap
 
 
-def locate_ewp(args):
+def locate_ewp(args, json_mode=False):
     if args.project:
         path = Path(args.project).resolve()
         if not path.is_file():
-            print("ERROR: {0} does not exist".format(path))
-            return None
+            return cc.fail("E_NOT_FOUND",
+                           "ERROR: {0} does not exist".format(path),
+                           details={"project": str(path)})
         return path
     search_path = Path(args.path).resolve()
     candidates = sorted(search_path.glob('**/*.ewp'))
     if not candidates:
-        print("ERROR: No .ewp file found under {0}".format(search_path))
-        return None
+        return cc.fail("E_NOT_FOUND",
+                       "ERROR: No .ewp file found under {0}".format(search_path),
+                       details={"search_path": str(search_path)})
     if len(candidates) > 1:
-        # Printing a notice and carrying on with [0] is not a choice, it is a
-        # guess the caller never made. Refuse instead.
+        if json_mode:
+            return cc.fail(
+                "E_VALIDATION",
+                "{0} .ewp files found under {1}; pass --project to choose one"
+                .format(len(candidates), search_path),
+                details={
+                    "candidates": [str(c) for c in candidates],
+                    "suggestion": '--project "{0}"'.format(candidates[0]),
+                },
+                exit_code=cc.EXIT_ARG)
         sys.stderr.write("ERROR: {0} .ewp files found under {1}; refusing to "
                          "guess.\n".format(len(candidates), search_path))
         for c in candidates:
             sys.stderr.write("  {0}\n".format(c))
         sys.stderr.write("\nPick one and pass it explicitly:\n")
         sys.stderr.write('  --project "{0}"\n'.format(candidates[0]))
-        return None
+        return cc.fail("E_VALIDATION", "", exit_code=cc.EXIT_ARG)
     return candidates[0]
 
 
-def refuse_ambiguous_config(ewp_path, parser):
-    """Refuse to guess between several build configurations. Returns exit code."""
+def refuse_ambiguous_config(ewp_path, parser, json_mode=False):
+    """Refuse to guess between several build configurations. Returns a CliResult."""
     configs = parser.list_configs()
     by_config = parser.defines_by_config()
+    if json_mode:
+        return cc.fail(
+            "E_VALIDATION",
+            "{0} has {1} build configurations and no -c was given; pass -c"
+            .format(ewp_path.name, len(configs)),
+            details={
+                "configs": [
+                    {"config": name,
+                     "macros": sorted(by_config.get(name, set()))}
+                    for name in configs
+                ],
+                "suggestion": '-c "{0}"'.format(configs[0]),
+            },
+            exit_code=cc.EXIT_ARG)
     sys.stderr.write("ERROR: {0} has {1} build configurations and no -c was "
                      "given; refusing to guess.\n"
                      .format(ewp_path.name, len(configs)))
@@ -1121,44 +1175,151 @@ def refuse_ambiguous_config(ewp_path, parser):
     sys.stderr.write("\nUse --list-configs or --dry-run to inspect without "
                      "writing, or --use-first-config only when the choice "
                      "genuinely does not matter.\n")
-    return 2
+    return cc.fail("E_VALIDATION", "", exit_code=cc.EXIT_ARG)
 
 
-def main(argv=None):
+def command(argv, context):
     args = build_arg_parser().parse_args(argv)
 
-    ewp_path = locate_ewp(args)
-    if ewp_path is None:
-        return 1
+    ewp_path = locate_ewp(args, json_mode=context.json_mode)
+    if isinstance(ewp_path, cc.CliResult):
+        return ewp_path
     print("Using: {0}".format(ewp_path))
 
     try:
         parser = EwpParser(str(ewp_path), config_name=args.config)
     except ValueError as exc:
-        print("ERROR: {0}".format(exc))
-        return 1
+        return cc.fail("E_VALIDATION", "ERROR: {0}".format(exc),
+                       details={"config": args.config}, exit_code=cc.EXIT_ARG)
 
     if args.list_configs:
         for name in parser.list_configs():
             print(name)
-        return 0
+        return cc.ok({"project": str(ewp_path),
+                      "configs": parser.list_configs()})
 
     # An ambiguous configuration must be resolved by the caller, never by XML
     # order. --dry-run and --list-configs stay open: they are how you look.
     if (args.config is None and not args.use_first_config
             and not args.dry_run and len(parser.list_configs()) > 1):
-        return refuse_ambiguous_config(ewp_path, parser)
+        return refuse_ambiguous_config(ewp_path, parser,
+                                       json_mode=context.json_mode)
 
     if parser.get_compiler_id() is None:
-        print("ERROR: no ICC* compiler settings found in configuration '{0}'."
-              .format(parser.get_config_name()))
-        return 1
+        return cc.fail(
+            "E_NOT_FOUND",
+            "ERROR: no ICC* compiler settings found in configuration '{0}'."
+            .format(parser.get_config_name()),
+            details={"config": parser.get_config_name()})
 
     resolver = IarPathResolver(iar_path=args.iar_path,
                                toolchain=parser.get_toolchain(),
-                               compiler_id=parser.get_compiler_id())
+                               compiler_id=parser.get_compiler_id(),
+                               interactive=not context.json_mode)
 
-    return generate(parser, resolver, args, ewp_path)
+    data, ok, report = generate(parser, resolver, args, ewp_path)
+    if not ok:
+        return cc.fail(
+            "E_VERIFICATION_FAILED", "post-generation self-check failed",
+            details={
+                "errors": list(report.errors),
+                "warnings": list(report.warnings),
+                "notes": list(report.notes),
+                "strict": args.verify_strict,
+                "summary": "{0} error(s), {1} warning(s)".format(
+                    len(report.errors), len(report.warnings)),
+            })
+    return cc.ok(data)
+
+
+AI_HELP = """---
+name: Iar2Clangd
+description: >
+  Generate .clangd and compile_commands.json from an IAR .ewp project for
+  clangd. Works for any IAR architecture (ICCARM, ICCRL78, ICCRX, ICC430).
+  Use when user asks to set up clangd for an IAR project, or mentions .ewp /
+  Embedded Workbench / icc<arch>.exe.
+ai_help_version: 0.1.0
+---
+
+# Iar2Clangd AI Help Guide
+
+## Quick Reference
+
+- **Generate from a project:** `Iar2Clangd.py --project <file.ewp> --json`
+- **Search a directory:** `Iar2Clangd.py -p <dir> --json`
+- **List configurations:** `Iar2Clangd.py -p <dir> --list-configs`
+- **Preview without writing:** `Iar2Clangd.py -p <dir> --dry-run`
+
+## When to Use
+
+Use this tool when the user asks to:
+- set up clangd for an IAR Embedded Workbench project (`.ewp`)
+- fix cross-file jump-to-definition that silently fails
+- regenerate `.clangd` / `compile_commands.json` after editing the project
+
+Do NOT use for:
+- Keil `.uvprojx` projects (use `Keil2Clangd.py`)
+- CMake projects (use `Cmake2Clangd.py`)
+
+## Command Reference
+
+- `-p, --path <dir>`: search path for a single `.ewp` (default: current dir)
+- `--project <file>`: explicit `.ewp` path, skipping the search
+- `-c, --config <name>` (alias `-t`): build configuration to generate for
+- `--use-first-config` (alias `--use-first-target`): accept the first XML config without asking
+- `-a, --absolute`: absolute paths in the generated files
+- `-o, --output <dir>`: output directory (default: the project's own dir)
+- `--iar-path <dir>`: IAR Embedded Workbench path
+- `--iar-target <triple>`: override the clang `--target` triple (`''` omits it)
+- `--no-probe`: do not run the IAR compiler for predefined macros
+- `--probe-args="..."`: extra options for the predef probe / core negotiation
+- `--no-core-probe`: do not ask the compiler which `--core` the device header needs
+- `--force-predef-header`: write the preinclude header even without a probe
+- `--list-configs`: list configurations and exit
+- `--no-clangd` / `--no-compile-commands`: skip one of the two artifacts
+- `--fix-placement`: write a pointer `.clangd` when the output dir is a sibling of the sources
+- `--scan-hidden-macros`: report macros the sources test that no configuration defines
+- `--no-verify` / `--verify-strict` / `--no-syntax-probe`: self-check controls
+- `--dry-run`: preview without writing
+- `--json`: machine envelope output (equivalent to `--format json`)
+
+## Input / Output
+
+- `--json` success: `{ok:true, data:{project, config, toolchain, output_dir, generated, verify, dry_run?}, error:null, meta:{log}}`
+- `--json` failure: envelope on stderr, stdout empty; `error.code` from the table below
+- human mode: the existing report on stdout, errors on stderr
+
+## Side Effects & Safety
+
+- Writes `.clangd`, `compile_commands.json` and `k2c_iar_predef.h` under the output dir by default.
+- `--fix-placement` writes a pointer `.clangd` at the sources' common ancestor.
+- Without `--no-probe`, runs `icc<arch>.exe` with `--predef_macros` (and a couple of test compiles for `--core`).
+- `--dry-run` previews without writing (data carries `dry_run: true`).
+
+## Exit Codes
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | runtime failure (see error.code) |
+| 2 | parameter / usage error (E_VALIDATION) |
+
+## Errors & Recovery
+
+| code | meaning | recovery |
+|---|---|---|
+| `E_VALIDATION` | bad argument / unknown config / ambiguous config or .ewp | fix the argument, or pass `-c` / `--project` |
+| `E_NOT_FOUND` | no `.ewp`, no ICC* compiler node, or `--project` missing | point at a real project file |
+| `E_VERIFICATION_FAILED` | generated files disagree or self-check failed | inspect error.details |
+| `E_INTERNAL` | unexpected bug | report it |
+"""
+
+
+def main(argv=None, sinks=None):
+    return cc.main(argv, sinks, command=command,
+                   parser_factory=build_arg_parser, ai_help=AI_HELP,
+                   prog="Iar2Clangd")
 
 
 if __name__ == '__main__':
