@@ -100,8 +100,9 @@ git clone https://github.com/patrick1099/repo-keeper
 py -3 repo-keeper/scripts/Keeper.py init -p <你的仓库>
 ```
 
-`init` 一条命令走完：判断当前分支 → 生成两层配置模板 → 治理 git 噪音 → 生成 clangd 配置
-→ 报告分支对账状态。退出码 `0` 就绪、`1` 有需要你决定的事、`2` 出错。
+`init` 一条命令走完：判断当前分支 → 必要时创建 worktree 并继承源工程 → 生成两层配置
+模板 → 治理 git 噪音 → 复用并重锚定 clangd 配置（不能复用才生成）→ 报告分支对账状态。
+退出码 `0` 就绪、`1` 有需要你决定的事、`2` 出错。
 
 ## 四个环节
 
@@ -109,7 +110,7 @@ py -3 repo-keeper/scripts/Keeper.py init -p <你的仓库>
 |---|---|---|
 | ① 落脚 | 不在共享分支上干活，开 worktree | `using-repo-keeper` |
 | ② 除噪 | 让 `git status` 只剩代码改动 | `repo-hygiene` |
-| ③ 索引 | 生成并自检 `.clangd` + `compile_commands.json` | `clangd-config` |
+| ③ 索引 | 复用并重锚定，或生成并自检 `.clangd` + `compile_commands.json` | `clangd-config` |
 | ④ 对账 | 只把代码提交搬进干净分支 | `clean-branch` |
 
 ①②③ 是机械的，`Keeper.py` 按固定顺序连起来跑，顺序本身承重（[为什么](docs/design.md#环节顺序)）。
@@ -154,8 +155,12 @@ IAR 后端不猜内建宏，直接跑 `icc<arch>.exe --predef_macros` 问编译�
 而输出常落在 `Proj`/`build` 而源码在兄弟目录，症状是同文件跳转正常、跨文件跳转静默失效。
 `--fix-placement` 在源码的最近公共祖先写一个指针 `.clangd`。
 
-项目搬家 / 换电脑 / 换 worktree 时走 re-anchor，外科手术式修正失效路径，不动注释与手工增补，
-文件清单对不上时拒绝改坏。`scripts/build_exe.bat` 打出随仓库走的 `repo-keeper-reanchor.exe`。
+同一 clone 新建 worktree 时，`Keeper.py` 会先复制源工作区（含 gitignore 挡住的本地产物，
+但不复制任何 `.git` 管理数据），再走 re-anchor 修正绝对路径，不再重复生成配置。源工作区有
+tracked 改动时它会在创建前停下，已有 worktree 也不会被覆盖。
+
+项目搬家 / 换电脑同样走 re-anchor：只修正失效路径，不动注释与手工增补，文件清单对不上时
+拒绝改坏。`scripts/build_exe.bat` 打出随仓库走的 `repo-keeper-reanchor.exe`。
 
 细节见 [clangd 后端](docs/design.md#clangd-后端)。
 

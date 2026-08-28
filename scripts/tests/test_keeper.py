@@ -8,11 +8,12 @@ import tomllib
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import Keeper  # noqa: E402
 import local_config  # noqa: E402
-from toolname import PROJECT_CONFIG_NAME  # noqa: E402
+from toolname import PROJECT_CONFIG_NAME, REANCHOR_EXE  # noqa: E402
 
 
 def _git(args, cwd):
@@ -152,6 +153,31 @@ class TestPushableBranch(KeeperTest):
 
 
 class TestWorktree(KeeperTest):
+    def _add_reusable_keil_config(self, missing_source=False):
+        proj = self.root / "Proj"
+        code = self.root / "Code"
+        proj.mkdir()
+        code.mkdir()
+        (proj / "Demo.uvprojx").write_bytes(b"<Project/>\n")
+        (code / "main.c").write_bytes(b"int app(void){return 0;}\n")
+        _git(["add", "Proj/Demo.uvprojx", "Code/main.c"], self.root)
+        _git(["commit", "-qm", "add project"], self.root)
+        source = "../Code/missing.c" if missing_source else "../Code/main.c"
+        entries = [{
+            "directory": str(proj).replace("\\", "/"),
+            "file": source,
+            "arguments": ["clang", "-c", source],
+        }]
+        (proj / "compile_commands.json").write_text(
+            json.dumps(entries), encoding="utf-8")
+        (proj / ".clangd").write_bytes(b"CompileFlags:\n  Add: [-DTEST]\n")
+        (self.root / REANCHOR_EXE).write_bytes(b"test exe")
+        info_exclude = self.root / ".git" / "info" / "exclude"
+        with open(info_exclude, "a", encoding="utf-8") as fh:
+            fh.write("\nlocal-cache.bin\n")
+        (self.root / "local-cache.bin").write_bytes(b"cache")
+        return proj
+
     def test_creates_the_worktree_and_continues_in_it(self):
         wt = self.base / "wt"
         rc, out, err = self.run_keeper("init", "-p", str(self.root),
@@ -160,6 +186,81 @@ class TestWorktree(KeeperTest):
         self.assertEqual(rc, 0, out + err)
         self.assertTrue((wt / "main.c").is_file())
         self.assertIn("以下步骤在新 worktree 里进行", out)
+
+    def test_copies_ignored_files_and_reanchors_instead_of_regenerating(self):
+        proj = self._add_reusable_keil_config()
+        wt = self.base / "wt"
+        with mock.patch.object(Keeper, "step_clangd",
+                               side_effect=AssertionError("must not regenerate")):
+            rc, out, err = self.run_keeper(
+                "init", "-p", str(self.root), "--worktree", str(wt),
+                "--branch", "task/reuse")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual((wt / "local-cache.bin").read_bytes(), b"cache")
+        self.assertTrue((wt / ".git").is_file())
+        self.assertFalse((wt / PROJECT_CONFIG_NAME).exists())
+        entries = json.loads((wt / proj.relative_to(self.root) /
+                              "compile_commands.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            entries[0]["directory"],
+            str(wt / proj.relative_to(self.root)).replace("\\", "/"))
+        self.assertIn("完成路径重锚定", out)
+
+    def test_does_not_copy_over_a_different_branch_baseline(self):
+        (self.root / "second.c").write_bytes(b"second\n")
+        _git(["add", "second.c"], self.root)
+        _git(["commit", "-qm", "second"], self.root)
+        first = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD~1"],
+            check=True, capture_output=True, encoding="utf-8").stdout.strip()
+        _git(["branch", "wt", first], self.root)
+        (self.root / "source-only.bin").write_bytes(b"source")
+        wt = self.base / "wt"
+        rc, out, err = self.run_keeper(
+            "init", "-p", str(self.root), "--worktree", str(wt))
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse((wt / "source-only.bin").exists())
+        self.assertIn("基线提交与源工作区不同", out)
+
+    def test_refuses_to_copy_visible_tracked_changes(self):
+        (self.root / "main.c").write_bytes(b"changed\n")
+        wt = self.base / "wt"
+        rc, out, _ = self.run_keeper(
+            "init", "-p", str(self.root), "--worktree", str(wt),
+            "--branch", "task/dirty")
+        self.assertEqual(rc, 1)
+        self.assertIn("源工作区有已跟踪改动", out)
+        self.assertFalse(wt.exists())
+
+    def test_existing_worktree_is_not_overwritten_from_source(self):
+        wt = self.base / "wt"
+        _git(["worktree", "add", "-q", "-b", "task/existing", str(wt)], self.root)
+        (self.root / "source-only.bin").write_bytes(b"source")
+        rc, out, err = self.run_keeper(
+            "init", "-p", str(self.root), "--worktree", str(wt),
+            "--branch", "task/existing")
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse((wt / "source-only.bin").exists())
+
+    def test_reanchor_failure_falls_back_to_generation(self):
+        self._add_reusable_keil_config(missing_source=True)
+        wt = self.base / "wt"
+        with mock.patch.object(Keeper, "step_clangd", return_value=0) as generate:
+            rc, out, err = self.run_keeper(
+                "init", "-p", str(self.root), "--worktree", str(wt),
+                "--branch", "task/fallback")
+        self.assertEqual(rc, 0, out + err)
+        generate.assert_called_once()
+        self.assertIn("回退到 clangd-config", out)
+
+    def test_nested_target_is_not_recursively_copied(self):
+        wt = self.root / "linked" / "wt"
+        rc, out, err = self.run_keeper(
+            "init", "-p", str(self.root), "--worktree", str(wt),
+            "--branch", "task/nested")
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue((wt / "main.c").is_file())
+        self.assertFalse((wt / "linked" / "wt").exists())
 
     def test_a_resolved_branch_warning_is_not_left_pending(self):
         # It used to still be listed as "your call" after being handled, which
@@ -248,6 +349,15 @@ class TestDryRunAndErrors(KeeperTest):
         self.run_keeper("init", "-p", str(self.root), "--dry-run")
         self.assertFalse(self.project_cfg.exists())
         self.assertFalse(self.fake_global.exists())
+
+    def test_worktree_dry_run_reports_copy_without_creating_target(self):
+        wt = self.base / "wt"
+        rc, out, err = self.run_keeper(
+            "init", "-p", str(self.root), "--worktree", str(wt),
+            "--branch", "task/dry", "--dry-run")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("会从源工作区复制", out)
+        self.assertFalse(wt.exists())
 
     def test_outside_a_repo_exits_two(self):
         outside = self.base / "nope"

@@ -11,10 +11,11 @@ an instruction can be skipped and nothing says so.
 
 ``init`` performs only actions that are **per-clone and reversible**:
 
-    generate the two config templates   (new files, outside git's view)
-    ignore rules -> .git/info/exclude   (never .gitignore; --shared is not passed)
-    freeze IDE state -> skip-worktree   (undo: RepoHygiene.py --unfreeze)
-    clangd config                       (generated files, already ignored)
+    create worktree + inherit local files (when --worktree creates one)
+    generate the two config templates    (new files, outside git's view)
+    ignore rules -> .git/info/exclude    (never .gitignore; --shared is not passed)
+    freeze IDE state -> skip-worktree    (undo: RepoHygiene.py --unfreeze)
+    clangd config                        (re-anchor a reusable Keil copy, or generate)
 
 Everything that needs a human stays a report: where to put a worktree, whether
 a committed ``.bin`` is a release artifact or residue, and the whole
@@ -23,6 +24,7 @@ clean-branch job (conflicts and migration direction are judgement, not steps).
 Exit codes: 0 = 就绪, 1 = 有需要你决定的事, 2 = 出错。
 """
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cli_common as cc  # noqa: E402
 import local_config  # noqa: E402
 import Proj2Clangd  # noqa: E402
+import ReAnchor  # noqa: E402
 import RepoHygiene  # noqa: E402
 from toolname import (GLOBAL_DIR_NAME, PROJECT_CONFIG_NAME,  # noqa: E402
                       REANCHOR_EXE, TOOL_NAME)
@@ -155,6 +158,17 @@ def worktree_list(path):
             br = line[len("branch "):]
             entries.append((br.removeprefix("refs/heads/"), cur))
     return entries
+
+
+def worktree_paths(path):
+    out = git(["worktree", "list", "--porcelain"], path) or ""
+    return [line[len("worktree "):] for line in out.splitlines()
+            if line.startswith("worktree ")]
+
+
+def tracked_changes(path):
+    out = git(["status", "--porcelain", "--untracked-files=no"], path) or ""
+    return [line for line in out.splitlines() if line]
 
 
 def _git_networked(args, cwd, timeout):
@@ -312,28 +326,84 @@ def step_make_worktree(root, report, remote, worktree_path, branch_name, dry_run
     if pushable:
         report.ask("新分支 {0} 同样能推到远端({1}),换个只在本机存在的名字。"
                    .format(effective, pushable))
-        return None, 1
+        return None, 1, False
     existing = dict((b, p) for b, p in worktree_list(root))
     if branch_name and branch_name in existing:
         report.ok("分支 {0} 已有 worktree: {1}".format(
             branch_name, existing[branch_name]))
-        return existing[branch_name], 0
+        return existing[branch_name], 0, False
+    dirty = tracked_changes(root)
+    if dirty:
+        report.ask("源工作区有已跟踪改动,不整树复制到新分支。先提交、暂存到别处或还原后再来。")
+        for line in dirty[:5]:
+            report.note("  " + line)
+        if len(dirty) > 5:
+            report.note("  ... 还有 {0} 条".format(len(dirty) - 5))
+        return None, 1, False
     if Path(worktree_path).exists() and any(Path(worktree_path).iterdir()):
         report.ask("{0} 已存在且非空,不覆盖。换个路径。".format(worktree_path))
-        return None, 1
+        return None, 1, False
     if dry_run:
         report.ok("[dry-run] 会建 worktree {0} (分支 {1})".format(
             worktree_path, branch_name))
-        return worktree_path, 0
+        return worktree_path, 0, True
     args = ["worktree", "add"]
     if branch_name:
         args += ["-b", branch_name]
     args.append(str(worktree_path))
     if git(args, root) is None:
         report.ask("建 worktree 失败,自己跑一遍看报什么: git worktree add ...")
-        return None, 1
+        return None, 1, False
     report.ok("建好 worktree: {0}".format(worktree_path))
-    return worktree_path, 0
+    return worktree_path, 0, True
+
+
+def _worktree_copy_ignore(source_root, target_root):
+    source = Path(source_root).resolve()
+    target = Path(target_root).resolve()
+    linked = {Path(p).resolve() for p in worktree_paths(source)}
+    linked.discard(source)
+    linked.add(target)
+
+    def ignore(directory, names):
+        current = Path(directory).resolve()
+        skipped = {name for name in names if name == ".git"}
+        if current == source and PROJECT_CONFIG_NAME in names:
+            skipped.add(PROJECT_CONFIG_NAME)
+        for worktree in linked:
+            if worktree.parent == current and worktree.name in names:
+                skipped.add(worktree.name)
+        return skipped
+
+    return ignore
+
+
+def _copy_candidate_count(source_root, ignore):
+    total = 0
+    for directory, dirs, files in os.walk(str(source_root), followlinks=False):
+        skipped = set(ignore(directory, dirs + files))
+        dirs[:] = [name for name in dirs if name not in skipped]
+        total += sum(1 for name in files if name not in skipped)
+    return total
+
+
+def step_copy_worktree(source_root, target_root, report, dry_run):
+    source = Path(source_root).resolve()
+    target = Path(target_root).resolve()
+    ignore = _worktree_copy_ignore(source, target)
+    total = _copy_candidate_count(source, ignore)
+    if dry_run:
+        report.ok("[dry-run] 会从源工作区复制 {0} 个文件到新 worktree"
+                  "(排除 .git、其他 worktree 和主检出专属配置)".format(total))
+        return 0
+    try:
+        shutil.copytree(str(source), str(target), dirs_exist_ok=True,
+                        copy_function=shutil.copy2, ignore=ignore, symlinks=True)
+    except OSError as exc:
+        report.ask("新 worktree 已创建,但继承源工程失败: {0}".format(exc))
+        return 1
+    report.ok("从源工作区继承了 {0} 个文件(含 gitignore 挡住的本地产物)".format(total))
+    return 0
 
 
 def step_configs(root, report, dry_run):
@@ -391,6 +461,16 @@ def _clangd_projects(found):
     return projects
 
 
+def _reusable_keil_projects(source_root):
+    projects = _clangd_projects(Proj2Clangd.detect(source_root))
+    if not projects or any(kind != "keil" for kind, _, _ in projects):
+        return []
+    for _, _, project in projects:
+        if project is None or not (Path(project).parent / "compile_commands.json").is_file():
+            return []
+    return projects
+
+
 def _report_reanchor_exe(root, report, projects):
     """Say whether the re-anchor exe made it into the repo root.
 
@@ -409,6 +489,29 @@ def _report_reanchor_exe(root, report, projects):
         return
     report.ask("{0} 没能放到仓库根 —— 换机器/换路径后没人能修 clangd 配置。"
                "看上面这一步的输出是哪一步卡住了。".format(REANCHOR_EXE))
+
+
+def step_reanchor(root, report, projects, dry_run, context, preview_root=None):
+    print("")
+    scan_root = preview_root if dry_run and preview_root else root
+    argv = ["--root", str(scan_root), "--no-pause"]
+    if dry_run:
+        argv.append("--dry-run")
+    result = ReAnchor.command(argv, context)
+    rc = _result_rc(result)
+    if rc:
+        message = getattr(getattr(result, "error", None), "message", None)
+        report.note("重锚定失败{0},回退到 clangd-config。"
+                    .format(": " + message if message else ""))
+        return 1
+    if dry_run:
+        report.ok("[dry-run] 复制后会运行 {0} 的同源迁移逻辑,只重锚定路径"
+                  .format(REANCHOR_EXE))
+        return 0
+    _report_reanchor_exe(root, report, projects)
+    report.ok("复用源工作区 clangd 配置并完成路径重锚定({0} 个工程)"
+              .format(len(projects)))
+    return 0
 
 
 def step_clangd(root, report, dry_run, context):
@@ -574,21 +677,43 @@ def cmd_init(args, context):
         # step would write into the checkout we just said not to work in.
         _summary(report)
         return _init_result(root, report, pending)
+    created_worktree = False
+    inherited_worktree = False
+    reusable_projects = []
     if args.worktree:
-        new_root, rc = step_make_worktree(root, report, remote, args.worktree,
-                                          args.branch, args.dry_run)
+        source_root = root
+        new_root, rc, created_worktree = step_make_worktree(
+            root, report, remote, args.worktree, args.branch, args.dry_run)
         if rc:
             _summary(report)
             return _init_result(root, report, pending)
         root = new_root
+        same_base = args.dry_run or git(["rev-parse", "HEAD"], source_root) == \
+            git(["rev-parse", "HEAD"], root)
+        if created_worktree and same_base:
+            reusable_projects = _reusable_keil_projects(source_root)
+            rc = step_copy_worktree(source_root, root, report, args.dry_run)
+            if rc:
+                _summary(report)
+                return _init_result(root, report, pending)
+            inherited_worktree = True
+        elif created_worktree:
+            report.ok("新 worktree 的基线提交与源工作区不同,保留 Git 检出内容,不整树覆盖")
         print("")
         print("以下步骤在新 worktree 里进行: {0}".format(root))
 
-    step_configs(root, report, args.dry_run)
-    pending += step_hygiene(root, report, args.dry_run, not args.no_apply,
+    stage_root = source_root if created_worktree and args.dry_run else root
+    step_configs(stage_root, report, args.dry_run)
+    pending += step_hygiene(stage_root, report, args.dry_run, not args.no_apply,
                             context)
-    pending += step_clangd(root, report, args.dry_run, context)
-    step_clean_branch(root, report)
+    if inherited_worktree and reusable_projects:
+        rc = step_reanchor(root, report, reusable_projects, args.dry_run, context,
+                           preview_root=stage_root)
+        if rc:
+            pending += step_clangd(stage_root, report, args.dry_run, context)
+    else:
+        pending += step_clangd(stage_root, report, args.dry_run, context)
+    step_clean_branch(stage_root, report)
     _summary(report)
     return _init_result(root, report, pending)
 
@@ -614,8 +739,9 @@ def cmd_explain(args, context):
 AI_HELP = """---
 name: Keeper
 description: >
-  One command that sets a repo up: generate config templates, write ignore
-  rules, freeze IDE state, generate clangd config -- everything per-clone and
+  One command that sets a repo up: inherit a new worktree's local files,
+  generate config templates, write ignore rules, freeze IDE state, reuse or
+  generate clangd config -- everything per-clone and
   reversible -- and report (never auto-do) what needs a human. Use when the
   user asks to set a repo up once (Keeper init), or to see which layer a
   config value came from (Keeper explain).
@@ -642,7 +768,7 @@ Do NOT use for:
 ## Command Reference
 
 - `init -p <repo>`: generate configs, run repo-hygiene, generate clangd config
-- `init --worktree <path> --branch <name>`: create a worktree for the work first
+- `init --worktree <path> --branch <name>`: create a worktree, inherit the source tree's local files, then re-anchor reusable Keil clangd config
 - `init --dry-run`: run the real path but write nothing
 - `init --no-apply`: scan only; do not write ignore rules / freeze / renormalize
 - `explain -p <repo>`: print which layer (global / project) each config value came from
@@ -656,7 +782,9 @@ Do NOT use for:
 ## Side Effects & Safety
 
 - `init` writes only per-clone, reversible state: `~/.repo-keeper/defaults.toml`,
-  `<repo>/.repo-keeper.local.toml`, `.git/info/` and `.git/index`. Never tracked files.
+  `<repo>/.repo-keeper.local.toml`, `.git/info/` and `.git/index`. With
+  `--worktree`, it also copies the source working tree except Git administration
+  data and re-anchors reusable Keil clangd config. Never changes tracked content.
 - Never rewrites a shared `.gitignore` (RepoHygiene runs in local mode only).
 - `--dry-run` / `--no-apply` write nothing.
 - Everything that needs a judgement stays a report: worktree location, clean-branch job.

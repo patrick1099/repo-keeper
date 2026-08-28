@@ -14,7 +14,7 @@ description: The one entry point for repo-keeper — use this whenever setting u
 |---|---|---|
 | ① 落脚 | 不在**能推到远端的分支**上干活 → 开 worktree | 本 skill |
 | ② 除噪 | 让 `git status` 只剩代码改动 | `repo-hygiene` |
-| ③ 索引 | 生成并自检 `.clangd` + `compile_commands.json` | `clangd-config` |
+| ③ 索引 | 复用并重锚定，不能复用才生成 `.clangd` + `compile_commands.json` | `clangd-config` |
 | ④ 对账 | 只把**代码**提交搬进干净分支 | `clean-branch` |
 
 ①②③ 是机械的，**由一个脚本按正确顺序连起来跑**，不靠这份文档嘱咐你去调三个 skill
@@ -51,8 +51,8 @@ fetch 的快照）并在报告里注明是快照 —— 宁可用旧数据，也
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keeper.py" init -p <仓库路径>
 ```
 
-它会：判断当前分支 → 生成两层配置模板 → 跑 repo-hygiene → 跑 clangd-config →
-报告 clean-branch 的状态。
+它会：判断当前分支 → 必要时创建 worktree 并继承源工作区 → 生成两层配置模板 →
+跑 repo-hygiene → 复用并重锚定 Keil clangd 配置（不能复用才生成）→ 报告 clean-branch 状态。
 
 退出码：**0 = 就绪，1 = 有需要用户决定的事，2 = 出错。**
 拿到 1 不要自作主张往下推 —— 把它列出来的那几条念给用户听。
@@ -76,8 +76,13 @@ AI/脚本调用时优先 `--json`（退出码 0/1/2 不变，参数错误也出 
 
 - 生成两层配置模板（新文件，git 看不见）
 - ignore 规则 → `.git/info/exclude`
+- 新建 worktree 后继承源工作区全部工程文件（含被 gitignore 挡住的本地产物；严格排除
+  `.git`、其他 linked worktree 和主检出专属的项目配置）。源工作区有可见的 tracked 改动时
+  拒绝复制，已有 worktree 也绝不覆盖。
 - IDE 状态文件 → `skip-worktree` 冻结（撤销：`RepoHygiene.py --unfreeze`）
-- clangd 配置（生成物，已被上面的规则挡住）—— **仓库里有几个 `.uvprojx`/`.ewp`
+- Keil worktree 已有完整 clangd 配置时，运行与 `repo-keeper-reanchor.exe` 同源的迁移逻辑，
+  只改路径；没有可复用配置、归属检查失败或不是 Keil 时才生成。**仓库里有几个
+  `.uvprojx`/`.ewp`
   就配几个**，每个数据库落在它自己工程目录里。两个工程共用一份是不成立的：
   一份放在两棵源码树共同祖先上的 `.clangd` 会把 App 的宏盖到 Boot 头上。
 - 换路径自修的 `repo-keeper-reanchor.exe` 放到仓库根（Keil 工程才有；`dist/`
