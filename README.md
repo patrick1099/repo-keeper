@@ -100,6 +100,18 @@ git clone https://github.com/patrick1099/repo-keeper
 py -3 repo-keeper/scripts/Keeper.py init -p <你的仓库>
 ```
 
+Windows 上也可以安装成单文件全局命令：
+
+```bat
+repo-keeper\scripts\install_hygiene_cli.bat
+repo-hygiene -p <你的仓库>
+repo-hygiene -p <你的仓库> --apply --dry-run
+```
+
+安装脚本用 PyInstaller 构建 `dist\repo-hygiene.exe`，再复制到
+`%LOCALAPPDATA%\Programs\bin`。安装后运行不再依赖 Python；该目录需要在用户 `PATH` 中。
+插件升级后重新运行一次安装脚本，即可让全局命令使用新规则。
+
 `init` 一条命令走完：判断当前分支 → 必要时创建 worktree 并继承源工程 → 生成两层配置
 模板 → 治理 git 噪音 → 复用并重锚定 clangd 配置（不能复用才生成）→ 报告分支对账状态。
 退出码 `0` 就绪、`1` 有需要你决定的事、`2` 出错。

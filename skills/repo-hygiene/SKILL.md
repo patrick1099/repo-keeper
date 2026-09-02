@@ -37,6 +37,17 @@ description: Make `git status` in a firmware repo show code changes only, WITHOU
 
 ## 用法
 
+本机装过全局 CLI 时可以直接运行：
+
+```powershell
+repo-hygiene -p <repo>
+repo-hygiene -p <repo> --apply --dry-run
+repo-hygiene -p <repo> --apply
+```
+
+Windows 安装入口是插件根目录的 `scripts\install_hygiene_cli.bat`。它构建单文件 exe 并复制到
+`%LOCALAPPDATA%\Programs\bin`；插件升级后需要重新运行一次。
+
 ```powershell
 # 只扫描,什么都不写 —— 默认行为,先看报告
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/RepoHygiene.py" -p <repo>
