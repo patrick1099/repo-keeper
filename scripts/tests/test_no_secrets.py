@@ -8,7 +8,8 @@ in CONTRIBUTING.
 
 Two halves, because they have opposite publication rules:
 
-  * **Structural and local-identity rules, in this file.** Things that are private by *shape*
+  * **Structural and local-identity rules, in ``secretscan.py``** (shared with the
+    push gate; traversal lives here). Things that are private by *shape*
     rather than by content: a home directory with a real username in it, a
     Keil user-state filename, a SID, a credential, a full git hash, a
     ``[[wiki-link]]`` into someone's private notes, or an email address. The
@@ -21,10 +22,7 @@ Two halves, because they have opposite publication rules:
     ``~/<tool>/audit-words.txt``, one entry per line, ``#`` for comments.
     Absent on a fresh clone -> that half is skipped and says so.
 """
-import getpass
 import os
-import re
-import socket
 import subprocess
 import sys
 import unittest
@@ -32,6 +30,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from toolname import GLOBAL_DIR_NAME  # noqa: E402
+from secretscan import (  # noqa: E402
+    HOME_DIR, HOME_OK, FULL_HASH, WIKI_LINK, EMAIL, email_is_ok,
+    KEIL_USER_FILE, KEIL_USER_OK, SID, contains_identity, credential_hits,
+    load_words, local_identity_words,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 WORDS_FILE = Path.home() / GLOBAL_DIR_NAME / "audit-words.txt"
@@ -43,19 +46,6 @@ SKIP_SUFFIXES = {".exe", ".png", ".jpg", ".gif", ".ico", ".zip", ".pyc"}
 #: This file necessarily contains the patterns it looks for.
 SELF = Path(__file__).name
 PUBLIC_REF_PREFIXES = ("refs/heads/", "refs/tags/", "refs/remotes/origin/")
-
-
-def local_identity_words():
-    values = {
-        getpass.getuser(),
-        socket.gethostname(),
-        Path.home().name,
-        os.environ.get("USERNAME", ""),
-        os.environ.get("COMPUTERNAME", ""),
-    }
-    generic = {"", "user", "username", "developer", "dev", "runner", "localhost"}
-    return sorted(value for value in values
-                  if len(value) >= 3 and value.lower() not in generic)
 
 
 LOCAL_IDENTITY_WORDS = local_identity_words()
@@ -95,73 +85,9 @@ def git_bytes(*args, input_data=None):
     return result.stdout
 
 
-def contains_identity(line, word):
-    pattern = r"(?<![A-Za-z0-9]){0}(?![A-Za-z0-9])".format(re.escape(word))
-    return re.search(pattern, line, re.IGNORECASE) is not None
-
-
-def is_placeholder_secret(value):
-    lowered = value.lower()
-    return (any(mark in value for mark in ("<", ">", "${", "{{", "***"))
-            or any(word in lowered for word in
-                   ("example", "placeholder", "dummy", "changeme", "redacted", "xxx")))
-
 
 def rel(path):
     return path.relative_to(REPO).as_posix()
-
-
-# ---------------------------------------------------------------------------
-# structural rules
-# ---------------------------------------------------------------------------
-
-# A home directory carries a real account name. Matches local and UNC Windows
-# profiles plus POSIX homes.
-HOME_DIR = re.compile(
-    r"(?:(?:[A-Za-z]:|\\\\[^\\/\s]+(?:[\\/]+[^\\/\s]+)?)[\\/]+"
-    r"(?:Users|Documents and Settings)[\\/]+|/home/|/Users/)"
-    r"([A-Za-z0-9._-]+)")
-#: Placeholders that are the point of the example, not a leak.
-HOME_OK = {"<user>", "you", "youruser", "username", "user", "me", "someone"}
-
-# A full object id pins the reader to one specific repository's history.
-FULL_HASH = re.compile(r"\b(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\b")
-
-# [[note-name]] links resolve only inside the author's private vault; in a
-# public repo they are both dead links and a table of contents of private notes.
-# Requires a letter inside, so `[[6]]`-style citation markers and array
-# indexing do not masquerade as note links.
-WIKI_LINK = re.compile(r"\[\[(?=[^\]\n]*[A-Za-z])[^\]\n]+\]\]")
-
-EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-EMAIL_OK = re.compile(r"@(example\.(com|org|net)|invalid|localhost"
-                      r"|users\.noreply\.github\.com|anthropic\.com)\b")
-
-KEIL_USER_FILE = re.compile(r"\.uvguix\.([A-Za-z0-9._-]+)\b", re.IGNORECASE)
-KEIL_USER_OK = {"dev", "developer", "user", "username", "test", "sample"}
-
-SID = re.compile(r"\bS-1-5-(?:21-)?\d+(?:-\d+){2,}\b", re.IGNORECASE)
-PRIVATE_KEY = re.compile(
-    r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")
-CREDENTIAL_URL = re.compile(
-    r"\b[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@", re.IGNORECASE)
-TOKEN = re.compile(
-    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
-    r"(?:AKIA|ASIA)[A-Z0-9]{16}|AIza[0-9A-Za-z_-]{30,}|"
-    r"xox[baprs]-[A-Za-z0-9-]{20,}|sk-[A-Za-z0-9_-]{20,})\b")
-SECRET_ASSIGNMENT = re.compile(
-    r"\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
-    r"password|passwd|pwd)\b\s*[:=]\s*[\"']?([^\s\"';,#]{8,})",
-    re.IGNORECASE)
-
-
-def credential_hits(line):
-    for pattern in (PRIVATE_KEY, CREDENTIAL_URL, TOKEN):
-        for match in pattern.finditer(line):
-            yield match.group(0)
-    for match in SECRET_ASSIGNMENT.finditer(line):
-        if not is_placeholder_secret(match.group(2)):
-            yield match.group(0)
 
 
 def is_skipped_history_path(path):
@@ -236,7 +162,7 @@ def history_line_hits(line, words):
     hits.extend(FULL_HASH.findall(line))
     hits.extend(WIKI_LINK.findall(line))
     for match in EMAIL.finditer(line):
-        if not EMAIL_OK.search(match.group(0)):
+        if not email_is_ok(match.group(0)):
             hits.append(match.group(0))
     for match in KEIL_USER_FILE.finditer(line):
         if match.group(1).lower() not in KEIL_USER_OK:
@@ -327,7 +253,7 @@ class TestStructuralLeaks(unittest.TestCase):
     def test_no_personal_email_addresses(self):
         def check(line):
             for m in EMAIL.finditer(line):
-                if not EMAIL_OK.search(m.group(0)):
+                if not email_is_ok(m.group(0)):
                     yield m.group(0)
         hits = self._sweep(check)
         self.assertEqual(hits, [], "\n真实邮箱地址:\n  " + "\n  ".join(hits))
@@ -389,17 +315,6 @@ class TestPatternCoverage(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # personal word list (kept outside this repo on purpose)
 # ---------------------------------------------------------------------------
-
-def load_words():
-    if not WORDS_FILE.is_file():
-        return None
-    words = []
-    for line in WORDS_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line:
-            words.append(line)
-    return words
-
 
 class TestPersonalWordList(unittest.TestCase):
     def test_no_listed_word_appears_anywhere(self):
