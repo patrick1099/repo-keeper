@@ -1,0 +1,12 @@
+#!/bin/sh
+# core.hooksPath 会整体屏蔽仓库自带的 .git/hooks，这个壳把调用接力回去，
+# 保证装了全局 commit-msg 闸之后，各仓库原有的钩子照常运行。
+HOOK_NAME=$(basename "$0")
+LOCAL_HOOK="$(git rev-parse --git-path "hooks/$HOOK_NAME" 2>/dev/null)"
+case "$LOCAL_HOOK" in
+	*/.githooks/*) exit 0 ;;
+esac
+if [ -n "$LOCAL_HOOK" ] && [ -x "$LOCAL_HOOK" ]; then
+	exec "$LOCAL_HOOK" "$@"
+fi
+exit 0

@@ -1,0 +1,55 @@
+#!/bin/sh
+# 全局闸：禁止任何 AI 署名进入 commit。
+# 由 core.hooksPath=~/.githooks 全机生效，对 Claude Code / Codex / opencode / 手工 commit 一视同仁。
+# 装于 2026-08-13。紧急放行：git commit --no-verify（并自行确认 message 干净）。
+
+MSG_FILE="$1"
+
+# 去掉注释行，只检查真正会写进 commit 的内容
+BODY=$(sed '/^#/d' "$MSG_FILE")
+
+AI='claude|anthropic|codex|opencode|copilot|cursor|gemini|chatgpt|openai|gpt-[0-9]|devin|aider|windsurf|sourcegraph|amp-ai|bot@'
+
+fail() {
+	echo "" >&2
+	echo "  提交被拒绝：commit 里出现 AI 署名。" >&2
+	echo "  $1" >&2
+	echo "" >&2
+	echo "  这是全局硬性规则（~/.githooks/commit-msg）：产出归用户，AI 不署名。" >&2
+	echo "  去掉该行后重新提交。确需放行用 git commit --no-verify。" >&2
+	echo "" >&2
+	exit 1
+}
+
+# 1) Co-Authored-By 尾巴
+if printf '%s\n' "$BODY" | grep -qiE "^[[:space:]]*co-authored-by:.*($AI)"; then
+	HIT=$(printf '%s\n' "$BODY" | grep -iE "^[[:space:]]*co-authored-by:.*($AI)" | head -n 1)
+	fail "命中 Co-Authored-By 行： $HIT"
+fi
+
+# 2) 生成标记 / 工具广告
+if printf '%s\n' "$BODY" | grep -qiE "(generated|created|written|assisted).{0,20}(with|by).{0,20}($AI)"; then
+	HIT=$(printf '%s\n' "$BODY" | grep -iE "(generated|created|written|assisted).{0,20}(with|by).{0,20}($AI)" | head -n 1)
+	fail "命中生成标记： $HIT"
+fi
+if printf '%s\n' "$BODY" | grep -q "🤖"; then
+	fail "命中机器人 emoji 🤖"
+fi
+
+# 3) author / committer 身份本身不能是 AI
+for IDENT in "$(git var GIT_AUTHOR_IDENT 2>/dev/null)" "$(git var GIT_COMMITTER_IDENT 2>/dev/null)"; do
+	if printf '%s\n' "$IDENT" | grep -qiE "($AI)"; then
+		fail "提交身份是 AI： $IDENT"
+	fi
+done
+
+# 放行仓库自带的 commit-msg 钩子（core.hooksPath 会屏蔽它，这里手工接力）
+LOCAL_HOOK="$(git rev-parse --git-path hooks/commit-msg 2>/dev/null)"
+case "$LOCAL_HOOK" in
+	*/.githooks/*) LOCAL_HOOK="" ;;
+esac
+if [ -n "$LOCAL_HOOK" ] && [ -x "$LOCAL_HOOK" ]; then
+	exec "$LOCAL_HOOK" "$@"
+fi
+
+exit 0
