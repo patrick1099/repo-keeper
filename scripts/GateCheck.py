@@ -280,6 +280,15 @@ def _parse_tag(data):
     return name, tagger, message
 
 
+def _scan_ref_names(ref_names, words, identity_words, sc):
+    """只扫 ref 名。纯删除的 push 没有对象可扫, 但 ref 名照样外发给远端。"""
+    hits = []
+    for name in dict.fromkeys(ref_names):
+        hits.extend(sc.scan_name(name, origin="ref", words=words,
+                                 identity_words=identity_words))
+    return hits
+
+
 def _scan_repo(repo, ranges, ref_names, words, identity_words, sc):
     """对给定范围做全量扫描，返回 Hit 列表。
 
@@ -294,9 +303,7 @@ def _scan_repo(repo, ranges, ref_names, words, identity_words, sc):
 
     hits = []
 
-    for name in dict.fromkeys(ref_names):
-        hits.extend(sc.scan_name(name, origin="ref", words=words,
-                                 identity_words=identity_words))
+    hits.extend(_scan_ref_names(ref_names, words, identity_words, sc))
 
     seen_paths = set()
     for oid, paths in objects.items():
@@ -399,16 +406,15 @@ def _parse_identity_words(value, sc):
     return [w.strip() for w in value.split(",") if w.strip()]
 
 
-def _run_scan_with_replacements(sc, repo, ranges, ref_names, words,
-                                identity_words, replacements_file):
+def _with_replacements(sc, replacements_file, scan):
     """--replacements-file 只改取数来源；不给时 suggestion 为空但不拦。"""
     if replacements_file is None:
-        return _scan_repo(repo, ranges, ref_names, words, identity_words, sc)
+        return scan()
     old = sc.DEFAULT_REPLACEMENTS_PATH
     sc.DEFAULT_REPLACEMENTS_PATH = Path(replacements_file)
     sc.clear_replacements_cache()
     try:
-        return _scan_repo(repo, ranges, ref_names, words, identity_words, sc)
+        return scan()
     finally:
         sc.DEFAULT_REPLACEMENTS_PATH = old
         sc.clear_replacements_cache()
@@ -437,8 +443,22 @@ def _emit_human_report(context, block_hits, warn_hits):
 
 def _do_scan(context, sc, repo, ranges, ref_names, words, identity_words,
              replacements_file):
-    hits = _run_scan_with_replacements(
-        sc, repo, ranges, ref_names, words, identity_words, replacements_file)
+    hits = _with_replacements(
+        sc, replacements_file,
+        lambda: _scan_repo(repo, ranges, ref_names, words, identity_words, sc))
+    return _finish_scan(context, hits)
+
+
+def _do_ref_scan(context, sc, ref_names, words, identity_words,
+                 replacements_file):
+    """纯删除的 push: 没有对象要扫, 但 ref 名要判。"""
+    hits = _with_replacements(
+        sc, replacements_file,
+        lambda: _scan_ref_names(ref_names, words, identity_words, sc))
+    return _finish_scan(context, hits)
+
+
+def _finish_scan(context, hits):
     block_hits = [h for h in hits if h.severity == "block"]
     warn_hits = [h for h in hits if h.severity == "warn"]
     if block_hits:
@@ -462,12 +482,13 @@ def _cmd_pre_push(args, context):
     if not lines:
         return cc.ok(_hit_payload([]))
     ranges, ref_names, _has_delete, has_non_delete = _parse_protocol_lines(lines)
-    if not has_non_delete:
-        return cc.ok(_hit_payload([]))
     _check_repo(args.repo)
     sc = _require_secretscan()
     words = _load_words(sc, args.words_file)
     identity_words = _parse_identity_words(args.identity_words, sc)
+    if not has_non_delete:
+        return _do_ref_scan(context, sc, ref_names, words, identity_words,
+                            args.replacements_file)
     return _do_scan(context, sc, args.repo, ranges, ref_names, words,
                     identity_words, args.replacements_file)
 

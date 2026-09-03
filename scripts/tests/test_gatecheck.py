@@ -169,6 +169,34 @@ class TestRangeCalculation(unittest.TestCase):
             self.assertEqual(code, 0, err)
             self.assertTrue(_load_json(out)["ok"])
 
+    def test_only_deletes_still_scan_ref_names(self):
+        # 纯删除没有对象可扫, 但被删的 ref 名仍会发给远端, 所以照扫。
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, sha1, _ = self._repo_with_sensitive_history(Path(tmp))
+            words = _words_file(Path(tmp))
+            stdin_text = "refs/heads/{0} {1} refs/heads/{0} {2}\n".format(
+                FAKE_WORDS[0], ZEROS40, sha1)
+            code, out, err = _run_gatecheck(
+                "pre-push", *_common_args(repo, words), stdin_text=stdin_text)
+            self.assertEqual(code, 1)
+            obj = _load_json(err)
+            self.assertEqual(obj["error"]["code"], "E_LEAK_FOUND")
+            hits = obj["error"]["details"]["hits"]
+            self.assertTrue(all(h["origin"] == "ref" for h in hits), hits)
+            self.assertTrue(any(h["rule"] == "WORD" for h in hits), hits)
+            self.assertNotIn(FAKE_WORDS[0], out + err)
+
+    def test_only_deletes_fail_closed_without_words(self):
+        # 纯删除现在也要判, 判不了就得拒——不能因为"反正是删除"而放行。
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, sha1, _ = self._repo_with_sensitive_history(Path(tmp))
+            missing = Path(tmp) / "no-such-words.txt"
+            code, out, err = _run_gatecheck(
+                "pre-push", *_common_args(repo, missing),
+                stdin_text="refs/heads/a {0} refs/heads/a {1}\n".format(ZEROS40, sha1))
+            self.assertEqual(code, 1)
+            self.assertEqual(_load_json(err)["error"]["code"], "E_GATE_UNAVAILABLE")
+
     def test_empty_stdin_exit_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo, _sha1, _ = self._repo_with_sensitive_history(Path(tmp))
