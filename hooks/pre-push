@@ -1,0 +1,179 @@
+#!/bin/sh
+# 敏感词 push 闸 —— 全局 pre-push 钩子（第二阶段第 2 批）。
+#
+# 两段式武装判定（task-secret-gate-phase2-batch2.md §2.1，方向不能反）：
+#   第一段（本文件）：URL 里大小写不敏感地含 "github" 就进第二段，不含就跳过
+#     扫描、python 不启动。这是**过近似**：任何会被 python 判定为 github.com
+#     目标的 URL，其主机名里必然含 "github" 子串，所以这段永远漏不掉一个真
+#     github 目标；最坏只是对"含 github 但不是 github 主机"的 URL 多启动一次
+#     python（慢一点）。反过来（sh 严 python 宽）就是静默放行，是这整个方案
+#     要消灭的失效模式。
+#   第二段（GateCheck.py arm）：权威的 URL 规范化 + 豁免表查询，回答该不该武装。
+#
+# stdin 是 git 协议输入，必须缓存原始字节并原样重放给仓库本地 pre-push（§2.2）。
+#
+# 接力是**无条件**的（方案 §D3 / §1.1）：core.hooksPath 是"替换"而不是"追加"，
+# 全局钩子一旦存在，各仓 .git/hooks 下的同名钩子就再也不会被 git 调起。所以本
+# 文件的每一条出口——包括"目标不是 github，本闸根本不管"这种最早的放行——都必须
+# 先把仓库本地 pre-push 跑一遍再退。少接力一条路径，那条路径上的本地钩子就被
+# 静默废掉了，而且盘上毫无痕迹：push 照样成功，git 也不会说一个字。
+#
+# 所有失败都 fail-closed（§4）：出任何错都退非零，绝不放行。「解析不出本地钩子
+# 该在哪」也算错——那等于不知道自己有没有把别人的钩子吞掉。
+
+set -u
+
+# ---------- 0) 缓存 stdin 原始字节（原样，不许逐行重组） ----------
+TMPFILE="$(mktemp 2>/dev/null)" || {
+    echo "敏感词闸：无法创建临时文件缓存 stdin，拒绝本次 push。" >&2
+    exit 1
+}
+trap 'rm -f -- "$TMPFILE"' EXIT INT TERM HUP
+cat > "$TMPFILE" || {
+    echo "敏感词闸：写入 stdin 缓存失败，拒绝本次 push。" >&2
+    exit 1
+}
+
+REMOTE_NAME="$1"
+REMOTE_URL="$2"
+
+# ---------- 1) 解析仓库本地 pre-push，并定义唯一的放行出口 ----------
+# 放在最前面：后面每一条放行都得走 relay_then_exit，接力目标必须先备好。
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+if [ -z "$COMMON_DIR" ]; then
+    echo "敏感词闸：无法解析 git common dir，定不出仓库本地 pre-push 在哪。" >&2
+    echo "  本闸会替换掉本地钩子，定不出就等于可能把它静默吞掉，故拒绝本次 push。" >&2
+    echo "  确需立即放行：git push --no-verify（并自行确认要外发的内容干净）。" >&2
+    exit 1
+fi
+LOCAL_HOOK="$COMMON_DIR/hooks/pre-push"
+
+# 防自我接力：本文件如果同时也被装成了仓库本地 pre-push，直接调下去就是无限
+# 递归，实测会把 push 挂死（而不是报错）。commit-msg 用 */.githooks/* 挡的是
+# 同一类事。这里比路径：同一个文件就当没有本地钩子。
+SELF_PATH="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+HOOK_PATH="$(cd "$(dirname "$LOCAL_HOOK")" 2>/dev/null && pwd)/$(basename "$LOCAL_HOOK")"
+if [ "$SELF_PATH" = "$HOOK_PATH" ]; then
+    LOCAL_HOOK=""
+fi
+
+# 唯一的放行出口：先跑仓库本地 pre-push（同一份原始 stdin），退出码原样传播。
+# 本地钩子不存在或不可执行时退 0——与 git 自己的行为一致（git 也只跑可执行的钩子）。
+relay_then_exit() {
+    if [ -n "$LOCAL_HOOK" ] && [ -f "$LOCAL_HOOK" ] && [ -x "$LOCAL_HOOK" ]; then
+        # 不能用 "$@"：函数里的 $@ 是函数自己的参数。git 的 pre-push 协议就是
+        # 这两个位置参数，原样转交。
+        "$LOCAL_HOOK" "$REMOTE_NAME" "$REMOTE_URL" < "$TMPFILE"
+        exit $?
+    fi
+    exit 0
+}
+
+# ---------- 2) sh 侧过近似预筛 ----------
+case "$REMOTE_URL" in
+    *[Gg][Ii][Tt][Hh][Uu][Bb]*)
+        : ;;
+    *)
+        relay_then_exit
+        ;;
+esac
+
+# ---------- 3) 解析 python / GateCheck.py / 配置根 ----------
+if [ -n "${REPO_KEEPER_PYTHON:-}" ]; then
+    PY_WORDS=$REPO_KEEPER_PYTHON
+elif command -v py >/dev/null 2>&1; then
+    PY_WORDS="py -3"
+elif command -v python3 >/dev/null 2>&1; then
+    PY_WORDS="python3"
+else
+    echo "敏感词闸：找不到 python 解释器（py -3 / python3），闸没跑成，拒绝本次 push。" >&2
+    echo "  确需立即放行：git push --no-verify（并自行确认要外发的内容干净）。" >&2
+    exit 1
+fi
+
+if [ -n "${REPO_KEEPER_GATECHECK:-}" ]; then
+    GATECHECK=$REPO_KEEPER_GATECHECK
+elif [ -n "${REPO_KEEPER_HOME:-}" ] && [ -f "$REPO_KEEPER_HOME/GateCheck.py" ]; then
+    GATECHECK="$REPO_KEEPER_HOME/GateCheck.py"
+elif [ -f "$HOME/.repo-keeper/GateCheck.py" ]; then
+    GATECHECK="$HOME/.repo-keeper/GateCheck.py"
+else
+    echo "敏感词闸：找不到 GateCheck.py，闸没跑成，拒绝本次 push。" >&2
+    echo "  确需立即放行：git push --no-verify（并自行确认要外发的内容干净）。" >&2
+    exit 1
+fi
+if [ ! -f "$GATECHECK" ]; then
+    echo "敏感词闸：GateCheck.py 不存在（$GATECHECK），闸没跑成，拒绝本次 push。" >&2
+    echo "  确需立即放行：git push --no-verify（并自行确认要外发的内容干净）。" >&2
+    exit 1
+fi
+
+if [ -n "${REPO_KEEPER_HOME:-}" ]; then
+    CFG_HOME=$REPO_KEEPER_HOME
+else
+    CFG_HOME="$HOME/.repo-keeper"
+fi
+
+# ---------- 4) arm 权威判定（sh 宽、python 严） ----------
+ARM_OUT="$($PY_WORDS "$GATECHECK" arm --url "$REMOTE_URL" --home "$CFG_HOME" --json 2>&1)"
+ARM_RC=$?
+if [ "$ARM_RC" -ne 0 ]; then
+    echo "敏感词闸：武装判定失败（退出码 $ARM_RC），无法确认该不该扫描，拒绝本次 push。" >&2
+    printf '%s\n' "$ARM_OUT" >&2
+    exit 1
+fi
+case "$ARM_OUT" in
+    *'"armed": true'*) ARMED=1 ;;
+    *'"armed": false'*) ARMED=0 ;;
+    *)
+        echo "敏感词闸：无法解析武装判定输出（没找到 armed 字段），拒绝本次 push。" >&2
+        printf '%s\n' "$ARM_OUT" >&2
+        exit 1
+        ;;
+esac
+if [ "$ARMED" -eq 0 ]; then
+    relay_then_exit
+fi
+
+# ---------- 5) 解析仓库路径 ----------
+REPO_DIR="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_DIR" ]; then
+    REPO_DIR="$(git rev-parse --git-dir 2>/dev/null)"
+fi
+if [ -z "$REPO_DIR" ]; then
+    echo "敏感词闸：无法确定仓库路径，拒绝本次 push。" >&2
+    exit 1
+fi
+
+# ---------- 6) 扫描（用缓存的原始 stdin） ----------
+SCAN_OUT="$($PY_WORDS "$GATECHECK" pre-push --repo "$REPO_DIR" --remote-name "$REMOTE_NAME" --remote-url "$REMOTE_URL" --json < "$TMPFILE" 2>&1)"
+SCAN_RC=$?
+if [ "$SCAN_RC" -ne 0 ]; then
+    case "$SCAN_OUT" in
+        *E_LEAK_FOUND*)
+            echo "敏感词闸：在本次要外发的内容里发现了敏感词（E_LEAK_FOUND），push 被拦下。" >&2
+            echo "  —— 这是「发现了泄漏」，不是「闸没跑成」。按下面的命中清单改掉后再推。" >&2
+            ;;
+        *E_GATE_UNAVAILABLE*)
+            echo "敏感词闸：闸没有跑成（E_GATE_UNAVAILABLE）——这不是发现了泄漏，而是检查本身失败。" >&2
+            echo "  请修复后重试；确需立即放行：git push --no-verify（并自担）。" >&2
+            ;;
+        *)
+            echo "敏感词闸：扫描失败（退出码 $SCAN_RC），无法确认本次 push 干净，拒绝。" >&2
+            ;;
+    esac
+    echo "---- 扫描器输出 ----" >&2
+    printf '%s\n' "$SCAN_OUT" >&2
+    exit 1
+fi
+
+case "$SCAN_OUT" in
+    *'"warn_count": 0'*) : ;;
+    *)
+        echo "敏感词闸：扫描通过，但有 warn 提示（不拦）：" >&2
+        printf '%s\n' "$SCAN_OUT" >&2
+        ;;
+esac
+
+# ---------- 7) 扫描通过，走同一个放行出口 ----------
+relay_then_exit

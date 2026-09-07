@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -679,6 +680,147 @@ class TestEnvelope(unittest.TestCase):
         self.assertIn("description:", text)
         self.assertIn("## Severity & Exit Codes", text)
         self.assertIn("## Errors & Recovery", text)
+
+
+class TestArm(unittest.TestCase):
+    """arm 只回答该不该武装：URL 规范化 + 豁免表查询，不扫描、不读词表、不碰 git。"""
+
+    def _arm(self, url, home=None):
+        argv = ["arm", "--url", url, "--json"]
+        if home is not None:
+            argv += ["--home", str(home)]
+        code, out, err = _run_gatecheck(*argv)
+        return code, out, err
+
+    def _data(self, url, home=None):
+        code, out, err = self._arm(url, home)
+        self.assertEqual(code, 0, err)
+        obj = _load_json(out)
+        self.assertTrue(obj["ok"], out)
+        return obj["data"]
+
+    def _empty_home(self, tmp):
+        home = Path(tmp) / "cfg"
+        home.mkdir()
+        return home
+
+    def test_url_shapes_normalize_to_same_key(self):
+        # §3.1：各种形状归一到同一个 github.com/owner/repo
+        owner_repo = "bob" + "/" + "projx"
+        shapes = [
+            "https://github.com/" + owner_repo,
+            "https://github.com/" + owner_repo + ".git",
+            "https://github.com/" + owner_repo + "/",
+            "git@github.com:" + owner_repo + ".git",
+            "ssh://git@github.com/" + owner_repo,
+            "HTTPS://GitHub.COM/" + "Bob" + "/" + "ProjX" + ".git",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._empty_home(tmp)
+            for url in shapes:
+                data = self._data(url, home)
+                self.assertTrue(data["is_github"], url)
+                self.assertEqual(data["normalized"], "github.com/" + owner_repo, url)
+                self.assertTrue(data["armed"], url)
+                self.assertEqual(data["reason"], "no_exempt", url)
+
+    def test_credentials_dropped_and_never_echoed(self):
+        # 凭据部分必须丢弃，且绝不出现在输出里
+        secret = "dave"
+        url = "https://bob:" + secret + "@github.com/bob/projx.git"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._empty_home(tmp)
+            code, out, err = self._arm(url, home)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(_load_json(out)["data"]["normalized"],
+                             "github.com/bob/projx")
+            self.assertNotIn(secret, out)
+            self.assertNotIn(secret, err)
+
+    def test_non_github_not_armed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._empty_home(tmp)
+            data = self._data("https://gerrit.company.com/projx", home)
+            self.assertFalse(data["is_github"])
+            self.assertFalse(data["armed"])
+            self.assertEqual(data["reason"], "not_github")
+            self.assertIsNone(data["normalized"])
+
+    def test_github_in_path_but_other_host_not_armed(self):
+        # sh 侧过近似会把它放进第二段，python 这一段才是权威判定
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._empty_home(tmp)
+            data = self._data("https://gitlab.example.com/github/x", home)
+            self.assertFalse(data["is_github"])
+            self.assertFalse(data["armed"])
+
+    def test_unrecognized_path_errs_toward_arming(self):
+        # 多余路径段判为不可识别 -> 往"武装"倒，绝不往"放行"倒
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._empty_home(tmp)
+            for url in ("https://github.com/a/b/c", "https://github.com/onlyowner"):
+                data = self._data(url, home)
+                self.assertTrue(data["is_github"], url)
+                self.assertIsNone(data["normalized"], url)
+                self.assertTrue(data["armed"], url)
+                self.assertEqual(data["reason"], "unrecognized_path", url)
+
+    def test_exempt_file_missing_means_armed(self):
+        # 豁免表不存在 -> 无豁免 -> 武装（保守方向，不是 fail-closed 报错）
+        with tempfile.TemporaryDirectory() as tmp:
+            data = self._data(PROJX_URL, Path(tmp) / "no-such-home")
+            self.assertTrue(data["armed"])
+            self.assertEqual(data["exempt_state"], "none")
+
+    def test_exempt_fresh_not_armed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._empty_home(tmp)
+            (home / "gate-exempt.txt").write_text(
+                "github.com/bob/projx {0}\n".format(datetime.now().isoformat()),
+                encoding="utf-8")
+            data = self._data(PROJX_URL, home)
+            self.assertFalse(data["armed"])
+            self.assertEqual(data["exempt_state"], "fresh")
+            self.assertEqual(data["reason"], "exempt_fresh")
+
+    def test_exempt_expired_armed(self):
+        # §3.3 本批的有意偏离：过期视为未豁免，照常武装并扫描（不联网复核）
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._empty_home(tmp)
+            stale = (datetime.now() - timedelta(days=TTL_OVER_DAYS)).isoformat()
+            (home / "gate-exempt.txt").write_text(
+                "github.com/bob/projx {0}\n".format(stale), encoding="utf-8")
+            data = self._data(PROJX_URL, home)
+            self.assertTrue(data["armed"])
+            self.assertEqual(data["exempt_state"], "expired")
+            self.assertEqual(data["reason"], "exempt_expired")
+
+    def test_exempt_match_is_exact_not_substring(self):
+        # 前缀相同的另一个仓不得把本仓豁免掉
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._empty_home(tmp)
+            (home / "gate-exempt.txt").write_text(
+                "github.com/bob/projx-extra {0}\n".format(datetime.now().isoformat()),
+                encoding="utf-8")
+            data = self._data(PROJX_URL, home)
+            self.assertTrue(data["armed"])
+            self.assertEqual(data["exempt_state"], "none")
+
+    def test_bad_timestamp_entry_is_dropped(self):
+        # checked_at 解析不了的条目直接丢弃 -> 宁可武装
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._empty_home(tmp)
+            (home / "gate-exempt.txt").write_text(
+                "github.com/bob/projx not-a-timestamp\n", encoding="utf-8")
+            data = self._data(PROJX_URL, home)
+            self.assertTrue(data["armed"])
+
+    def test_missing_url_exits_two(self):
+        code, out, err = _run_gatecheck("arm", "--json")
+        self.assertEqual(code, 2, out + err)
+
+
+TTL_OVER_DAYS = GateCheck.TTL_DAYS + 1
 
 
 if __name__ == "__main__":

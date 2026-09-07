@@ -1,11 +1,23 @@
 #!/bin/sh
 # core.hooksPath 会整体屏蔽仓库自带的 .git/hooks，这个壳把调用接力回去，
 # 保证装了全局 commit-msg 闸之后，各仓库原有的钩子照常运行。
+# 不能用 --git-path：设了 core.hooksPath 后它返回的就是全局钩子自己，立刻
+# 命中防递归分支（方案 §1.1）。与 hooks/pre-push 同一口径：用
+# --path-format=absolute --git-common-dir 拼出仓库本地钩子。
 HOOK_NAME=$(basename "$0")
-LOCAL_HOOK="$(git rev-parse --git-path "hooks/$HOOK_NAME" 2>/dev/null)"
-case "$LOCAL_HOOK" in
-	*/.githooks/*) exit 0 ;;
-esac
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+# 定不出本地钩子在哪就等于可能把它静默吞掉，fail-closed（与 hooks/pre-push 同一口径）
+if [ -z "$COMMON_DIR" ]; then
+	echo "全局钩子壳：无法定位仓库本地 $HOOK_NAME，无法保证接力，拒绝。" >&2
+	exit 1
+fi
+LOCAL_HOOK="$COMMON_DIR/hooks/$HOOK_NAME"
+# 防自我接力：全局和本地是同一个文件时视为没有本地钩子
+SELF_PATH="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+HOOK_PATH="$(cd "$(dirname "$LOCAL_HOOK")" 2>/dev/null && pwd)/$(basename "$LOCAL_HOOK")"
+if [ "$SELF_PATH" = "$HOOK_PATH" ]; then
+	LOCAL_HOOK=""
+fi
 if [ -n "$LOCAL_HOOK" ] && [ -x "$LOCAL_HOOK" ]; then
 	exec "$LOCAL_HOOK" "$@"
 fi
