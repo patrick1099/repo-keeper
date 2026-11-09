@@ -5,6 +5,8 @@ description: Generate and validate .clangd + compile_commands.json for embedded 
 
 # Project to clangd Configuration Generator
 
+首次安装、换机器、换宿主或依赖缺失时，先读[安装与适配](../../SETUP.md)；环境已就绪时直接按下文使用。
+
 Generate `.clangd` and `compile_commands.json` for an embedded C project, then
 validate the output and fix what the scripts cannot.
 

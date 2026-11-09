@@ -5,6 +5,8 @@ description: Use when keeping two long-lived branches in sync where they have a 
 
 # Clean branch — 只让代码提交进那条干净分支
 
+首次安装、换机器、换宿主或依赖缺失时，先读[安装与适配](../../SETUP.md)；环境已就绪时直接按下文使用。
+
 两条长期分支越漂越远，而 merge 是错的。出现在两种情况下：
 
 - 分支有**角色分工**（A = 纯代码，B = 代码 + 文档/工具的超集），内容归属是有讲究的；或者

@@ -5,6 +5,8 @@ description: The one entry point for repo-keeper — use this whenever setting u
 
 # repo-keeper —— 仓库管家
 
+首次安装、换机器、换宿主或依赖缺失时，先读[安装与适配](../../SETUP.md)；环境已就绪时直接按下文使用。
+
 **这是唯一需要记住的名字。** 另外三个 skill 是它的四个环节里的三个，由这里分派，
 不需要点名调用。
 

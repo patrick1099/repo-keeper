@@ -5,6 +5,8 @@ description: Make `git status` in a firmware repo show code changes only, WITHOU
 
 # Repo hygiene — 让待提交列表只剩代码
 
+首次安装、换机器、换宿主或依赖缺失时，先读[安装与适配](../../SETUP.md)；环境已就绪时直接按下文使用。
+
 四类噪音，**三种不同的修法**。选错了不是效果差，是根本不起作用，或者把同事的文件删了。
 
 | 噪音 | 例子 | 正确修法 | 用错会怎样 |
